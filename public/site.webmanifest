@@ -1,0 +1,16 @@
+{
+  "name": "DMARC Ready",
+  "short_name": "DMARC Ready",
+  "description": "Read-only email authentication and DMARC configuration scanner.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f8f5",
+  "theme_color": "#081c18",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

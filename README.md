@@ -29,12 +29,11 @@ The current release is an intentionally focused MVP: no accounts, no mailbox acc
 - React 19 and TypeScript
 - Vite
 - Cloudflare Workers Static Assets
-- Cloudflare 1.1.1.1 DNS-over-HTTPS JSON API
+- Cloudflare Workers `node:dns` API, backed by DNS-over-HTTPS
 - Vitest
 - Wrangler
 
-The frontend and API Worker deploy as one Cloudflare Worker. Static files are served from the Vite `dist` directory and `/api/*` routes run through the Worker.
-The `global_fetch_strictly_public` compatibility flag allows the Worker to reach Cloudflare's public DNS-over-HTTPS endpoint as an external dependency.
+The frontend and API Worker deploy as one Cloudflare Worker. Static files are served from the Vite `dist` directory and `/api/*` routes run through the Worker. The `nodejs_compat` flag enables Cloudflare's supported `node:dns` resolver inside the Worker runtime.
 
 ## Local development
 

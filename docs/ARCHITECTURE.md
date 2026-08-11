@@ -12,7 +12,7 @@ flowchart LR
     U[Browser] -->|POST /api/scan| W[Cloudflare Worker]
     W --> V[Input validation]
     V --> S[Scanner engine]
-    S -->|Bounded DoH queries| D[Cloudflare 1.1.1.1]
+    S -->|Bounded node:dns queries| D[Cloudflare DNS-over-HTTPS]
     S --> P[Deterministic parsers]
     P --> A[Findings and score]
     A -->|Structured JSON| U

@@ -1,29 +1,10 @@
+import dns from "node:dns";
 import type { DnsRecordView } from "../shared/types";
 
 export type DnsQueryType = "TXT" | "MX" | "NS" | "CNAME";
 
-const DNS_TYPE_CODES: Record<DnsQueryType, number> = {
-  CNAME: 5,
-  MX: 15,
-  TXT: 16,
-  NS: 2,
-};
-
 const DNS_TIMEOUT_MS = 4_500;
 const MAX_DNS_QUERIES = 48;
-
-interface DnsJsonAnswer {
-  name?: unknown;
-  type?: unknown;
-  TTL?: unknown;
-  data?: unknown;
-}
-
-interface DnsJsonResponse {
-  Status?: unknown;
-  Answer?: unknown;
-  Comment?: unknown;
-}
 
 export interface DnsAnswer {
   name: string;
@@ -60,52 +41,44 @@ export class DnsClient {
   }
 
   private async fetchQuery(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
-    const endpoint = new URL("https://cloudflare-dns.com/dns-query");
-    endpoint.searchParams.set("name", name);
-    endpoint.searchParams.set("type", type);
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), DNS_TIMEOUT_MS);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
 
     try {
-      const response = await fetch(endpoint.toString(), {
-        method: "GET",
-        headers: {
-          Accept: "application/dns-json",
-        },
-        redirect: "error",
-        signal: controller.signal,
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new DnsQueryError("DNS resolver timed out.")), DNS_TIMEOUT_MS);
       });
-
-      if (!response.ok) {
-        throw new DnsQueryError(`DNS resolver returned HTTP ${response.status}.`);
-      }
-
-      const body = (await response.json()) as DnsJsonResponse;
-      const status = typeof body.Status === "number" ? body.Status : -1;
-      // Status 3 is NXDOMAIN. It is a valid, empty DNS result rather than an
-      // upstream failure.
-      if (status !== 0 && status !== 3) {
-        throw new DnsQueryError(`DNS resolver returned status ${status}.`);
-      }
-      if (status === 3 || !Array.isArray(body.Answer)) return [];
-
-      const expectedCode = DNS_TYPE_CODES[type];
-      return body.Answer.flatMap((raw): DnsAnswer[] => {
-        if (!isDnsJsonAnswer(raw) || raw.type !== expectedCode) return [];
-        const recordName = stripFinalDot(raw.name);
-        const ttl = typeof raw.TTL === "number" && Number.isFinite(raw.TTL) && raw.TTL >= 0 ? raw.TTL : undefined;
-        const data = type === "TXT" ? decodeDnsTxt(raw.data) : stripFinalDot(raw.data.trim());
-        return [{ name: recordName, type, ttl, data }];
-      });
+      return await Promise.race([this.resolveNodeDns(name, type), timeoutPromise]);
     } catch (error) {
       if (error instanceof DnsQueryError) throw error;
-      if (error instanceof DOMException && error.name === "AbortError") {
-        throw new DnsQueryError("DNS resolver timed out.");
-      }
+      if (isDnsAbsenceError(error)) return [];
       throw new DnsQueryError("DNS resolver could not be reached.");
     } finally {
-      clearTimeout(timeout);
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  }
+
+  private async resolveNodeDns(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
+    switch (type) {
+      case "TXT": {
+        const records = await dns.promises.resolveTxt(name);
+        return records.map((chunks) => ({ name, type, data: chunks.join("") }));
+      }
+      case "MX": {
+        const records = await dns.promises.resolveMx(name);
+        return records.map((record) => ({
+          name,
+          type,
+          data: `${record.priority} ${stripFinalDot(record.exchange)}`,
+        }));
+      }
+      case "NS": {
+        const records = await dns.promises.resolveNs(name);
+        return records.map((record) => ({ name, type, data: stripFinalDot(record) }));
+      }
+      case "CNAME": {
+        const records = await dns.promises.resolveCname(name);
+        return records.map((record) => ({ name, type, data: stripFinalDot(record) }));
+      }
     }
   }
 }
@@ -183,15 +156,10 @@ function normalizeDnsQueryName(name: string): string {
   return normalized;
 }
 
-function isDnsJsonAnswer(value: unknown): value is {
-  name: string;
-  type: number;
-  data: string;
-  TTL?: unknown;
-} {
-  if (!value || typeof value !== "object") return false;
-  const answer = value as DnsJsonAnswer;
-  return typeof answer.name === "string" && typeof answer.type === "number" && typeof answer.data === "string";
+function isDnsAbsenceError(value: unknown): boolean {
+  if (!value || typeof value !== "object" || !("code" in value)) return false;
+  const code = (value as { code?: unknown }).code;
+  return code === "ENODATA" || code === "ENOTFOUND" || code === "ENONAME" || code === "NXDOMAIN";
 }
 
 function stripFinalDot(value: string): string {

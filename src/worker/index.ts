@@ -33,7 +33,7 @@ export default {
       return jsonResponse({
         status: "ok",
         service: "dmarc-ready-scanner",
-        version: "0.2.0",
+        version: "0.2.1",
         deploymentId: env.VERSION_METADATA?.id ?? null,
       });
     }
@@ -136,9 +136,7 @@ async function handleLookup(request: Request): Promise<Response> {
       return errorResponse(error.message, "BAD_REQUEST", 400);
     }
     if (error instanceof LookupUpstreamError) {
-      const response = errorResponse("DNS data is temporarily unavailable. Please try again.", "UPSTREAM_ERROR", 502);
-      response.headers.set("X-DNS-Upstream-State", error.message.slice(0, 160));
-      return response;
+      return errorResponse("DNS data is temporarily unavailable. Please try again.", "UPSTREAM_ERROR", 502);
     }
     return errorResponse("The DNS lookup could not be completed. Please try again.", "UPSTREAM_ERROR", 502);
   }

@@ -27,8 +27,8 @@ The scanner intentionally limits:
 - Total lookup count and concurrent upstream connections
 - Recursive SPF depth
 - Upstream request duration
-- Upstream response size and answer count
+- Normalized answer count and character volume
 
-All DNS resolution uses a fixed Google Public DNS-over-HTTPS endpoint with redirects disabled. DNS response codes are handled explicitly so temporary resolver failures are not converted into absent records. The advanced lookup route accepts only an allowlisted record type and a validated public owner name; it cannot select an upstream host or fetch an arbitrary URL.
+All DNS resolution uses Cloudflare Workers' native `node:dns` implementation, which is backed by Cloudflare DNS at 1.1.1.1. Native absence codes produce empty answers; timeouts, SERVFAIL, REFUSED, and transport failures remain errors when the runtime exposes those conditions. The advanced lookup route accepts only an allowlisted record type and a validated public owner name; it cannot select an upstream host or fetch an arbitrary URL.
 
 Future DMARC aggregate-report ingestion will require additional controls for compressed files, XML entities, expansion ratios, tenant mapping, deduplication, and report-email authentication before it is enabled in production.

@@ -37,11 +37,18 @@ describe("DNS lookup request validation", () => {
     },
   );
 
+  it.each(["CERT", "DNSKEY", "DS", "IPSECKEY", "LOC", "NSEC", "NSEC3PARAM", "RRSIG", "TLSA"])(
+    "rejects the non-native record type %s",
+    (type) => {
+      expect(() => normalizeLookupRequest("example.com", type)).toThrow(LookupValidationError);
+    },
+  );
+
   it("normalizes case, IDNs, a root dot, and service labels with underscores", () => {
-    expect(normalizeLookupRequest("  _443._TCP.BÜCHER.Example.COM.  ", "TLSA")).toEqual({
-      input: "_443._tcp.xn--bcher-kva.example.com",
-      queryName: "_443._tcp.xn--bcher-kva.example.com",
-      type: "TLSA",
+    expect(normalizeLookupRequest("  _SIP._TCP.BÜCHER.Example.COM.  ", "SRV")).toEqual({
+      input: "_sip._tcp.xn--bcher-kva.example.com",
+      queryName: "_sip._tcp.xn--bcher-kva.example.com",
+      type: "SRV",
     });
     expect(normalizeLookupRequest("Selector._DomainKey.Example.COM", "TXT").queryName).toBe(
       "selector._domainkey.example.com",

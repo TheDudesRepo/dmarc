@@ -5,14 +5,14 @@
 DMARC Ready deploys as one Cloudflare Worker containing two layers:
 
 1. A Vite-built React single-page application served through Workers Static Assets.
-2. A Worker API that handles `/api/*`, validates domain input, performs bounded DNS-over-HTTPS queries, and returns structured JSON.
+2. A Worker API that handles `/api/*`, validates domain input, performs bounded native DNS queries, and returns structured JSON.
 
 ```mermaid
 flowchart LR
     U[Browser] -->|POST /api/scan| W[Cloudflare Worker]
     W --> V[Input validation]
     V --> S[Scanner engine]
-    S -->|Bounded fixed-endpoint queries| D[Google Public DNS-over-HTTPS]
+    S -->|Bounded native queries| D[Cloudflare DNS at 1.1.1.1]
     S --> P[Deterministic parsers]
     P --> A[Findings and score]
     A -->|Structured JSON| U
@@ -27,17 +27,17 @@ The scan API accepts a single public domain value. It rejects email addresses, I
 
 ### DNS answers
 
-Every record is attacker-controlled text. DNS data is parsed with size limits and returned as JSON. React renders values as text; no raw HTML rendering is used.
+Every record is attacker-controlled text. DNS data is validated against answer-count and character-volume limits, normalized, and returned as JSON. React renders values as text; no raw HTML rendering is used.
 
 ### Upstream requests
 
-All resolution uses a fixed HTTPS endpoint. The scanner cannot fetch a URL derived from user input, preventing the scan endpoint from becoming a general-purpose SSRF proxy.
+All resolution uses the Worker's fixed native DNS resolver. The scanner cannot select an upstream host or fetch a URL derived from user input, preventing the scan endpoint from becoming a general-purpose SSRF proxy.
 
 ## Request flow
 
 1. Validate HTTP method, content type, and body size.
 2. Normalize and validate the requested public domain.
-3. Execute fixed-endpoint DNS-over-HTTPS queries with bounded concurrency, retries, timeouts, response-size limits, and a shared subrequest budget.
+3. Execute native DNS queries with bounded concurrency, retry handling, timeouts, result-size limits, per-request caching, and a shared subrequest budget.
 4. Parse TXT record boundaries without combining separate resource records.
 5. Analyze DMARC, SPF, core DNS health, mail routing, transport controls, and limited DKIM selector evidence.
 6. Produce stable check identifiers and deterministic findings.

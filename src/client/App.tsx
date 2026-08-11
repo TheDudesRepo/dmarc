@@ -61,28 +61,11 @@ const COMMON_DNS_LOOKUP_TYPES: DnsLookupType[] = [
   "PTR",
 ];
 
-const ADVANCED_DNS_LOOKUP_TYPES: DnsLookupType[] = [
-  "DNSKEY",
-  "DS",
-  "RRSIG",
-  "NSEC",
-  "NSEC3PARAM",
-  "CERT",
-  "LOC",
-  "IPSECKEY",
-  "TLSA",
-];
-
 const DNS_LOOKUP_HINTS: Partial<Record<DnsLookupType, string>> = {
   TXT: "Use the exact owner name, such as selector._domainkey.example.com for a DKIM key.",
   CNAME: "Use the alias owner name, such as www.example.com.",
   SRV: "Service records use _service._protocol, such as _sip._tcp.example.com.",
   PTR: "Enter an IPv4 or IPv6 address; the server converts it to the reverse-DNS owner name.",
-  TLSA: "TLSA owners include port and protocol, such as _25._tcp.mx.example.com.",
-  DNSKEY: "Use the zone name whose published DNSSEC keys you want to inspect.",
-  DS: "Use the delegated child-zone name whose parent-published DS record you want to inspect.",
-  RRSIG: "Use the exact owner name whose DNSSEC signatures you want to inspect.",
-  NSEC: "Use an owner name in a DNSSEC-signed zone; an empty answer is not automatically an error.",
 };
 
 function isScanResult(value: unknown): value is ScanResult {
@@ -133,13 +116,12 @@ function dnsLookupExample(type: DnsLookupType, suggestedDomain: string): string 
   if (type === "TXT") return `selector._domainkey.${domain}`;
   if (type === "CNAME") return `www.${domain}`;
   if (type === "SRV") return `_sip._tcp.${domain}`;
-  if (type === "TLSA") return `_25._tcp.mx.${domain}`;
   return domain;
 }
 
 function suggestedDnsLookupInput(type: DnsLookupType, suggestedDomain: string): string {
   if (!suggestedDomain || type === "PTR") return "";
-  if (type === "CNAME" || type === "SRV" || type === "TLSA") {
+  if (type === "CNAME" || type === "SRV") {
     return dnsLookupExample(type, suggestedDomain);
   }
   return suggestedDomain;
@@ -440,6 +422,9 @@ function FindingRow({ finding, index }: { finding: Finding; index: number }) {
       ]
     : [];
   const copiedFieldLabel = remediationFields.find((field) => field.key === copiedField)?.label;
+  const remediationCautionId = finding.remediation?.caution
+    ? `${finding.id}-remediation-caution`
+    : undefined;
 
   return (
     <li className={`finding finding-${finding.severity}`}>
@@ -469,12 +454,23 @@ function FindingRow({ finding, index }: { finding: Finding; index: number }) {
                   ))}
                 </ol>
               )}
+              {finding.remediation.caution && (
+                <div className="remediation-caution" id={remediationCautionId} role="note">
+                  <AlertTriangle aria-hidden="true" />
+                  <div><strong>Before you publish</strong><span>{finding.remediation.caution}</span></div>
+                </div>
+              )}
               {remediationRecord && (
-                <div className="fix-record" role="group" aria-label="Copy-ready DNS record">
+                <div
+                  className="fix-record"
+                  role="group"
+                  aria-label="DNS record template"
+                  aria-describedby={remediationCautionId}
+                >
                   <div className="fix-record-heading">
                     <div>
-                      <strong>Copy-ready DNS record</strong>
-                      <span>Use these fields in your DNS provider.</span>
+                      <strong>DNS record template</strong>
+                      <span>Review the steps and any caution before publishing.</span>
                     </div>
                     <Code2 aria-hidden="true" />
                   </div>
@@ -507,12 +503,6 @@ function FindingRow({ finding, index }: { finding: Finding; index: number }) {
                   {copyFailed && (
                     <p className="copy-error" role="alert">Copy failed. Select and copy the value manually.</p>
                   )}
-                </div>
-              )}
-              {finding.remediation.caution && (
-                <div className="remediation-caution" role="note">
-                  <AlertTriangle aria-hidden="true" />
-                  <div><strong>Before you publish</strong><span>{finding.remediation.caution}</span></div>
                 </div>
               )}
             </div>
@@ -855,11 +845,8 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
                 onChange={(event) => handleLookupTypeChange(event.target.value as DnsLookupType)}
                 disabled={lookupLoading}
               >
-                <optgroup label="Common DNS records">
+                <optgroup label="DNS record types">
                   {COMMON_DNS_LOOKUP_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
-                </optgroup>
-                <optgroup label="DNSSEC and advanced records">
-                  {ADVANCED_DNS_LOOKUP_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
                 </optgroup>
               </select>
             </div>

@@ -14,9 +14,9 @@ The current release is an intentionally focused MVP: no accounts, no mailbox acc
 - Inventories A, AAAA, CNAME, TXT, MX, NS, SOA, and CAA answers in the main scan
 - Looks for MTA-STS, SMTP TLS reporting, and BIMI records
 - Checks a small set of common DKIM selectors without claiming that non-discovery means DKIM is absent
-- Provides an advanced lookup for common, DNSSEC, and specialist record types
+- Provides an advanced lookup for ten common record types supported by Cloudflare's native DNS resolver
 - Produces deterministic, prioritized findings with raw DNS evidence and guided remediation
-- Shows copy-ready DNS record templates when a safe template is possible, with deployment cautions
+- Shows reviewable DNS record templates when a safe template is possible, with deployment cautions
 - Clearly warns that public DNS alone cannot prove a domain is safe to move into enforcement
 
 ## Product principles
@@ -32,11 +32,11 @@ The current release is an intentionally focused MVP: no accounts, no mailbox acc
 - React 19 and TypeScript
 - Vite
 - Cloudflare Workers Static Assets
-- A fixed, RCODE-aware Google Public DNS-over-HTTPS resolver
+- Cloudflare Workers' native `node:dns` resolver, backed by Cloudflare DNS at 1.1.1.1
 - Vitest
 - Wrangler
 
-The frontend and API Worker deploy as one Cloudflare Worker. Static files are served from the Vite `dist` directory and `/api/*` routes run through the Worker. DNS requests use one fixed resolver endpoint, bounded concurrency, strict response limits, explicit DNS response-code handling, per-request caching, and a hard subrequest budget.
+The frontend and API Worker deploy as one Cloudflare Worker. Static files are served from the Vite `dist` directory and `/api/*` routes run through the Worker. DNS requests use the platform's fixed native resolver with bounded concurrency, per-request caching, timeouts, strict result limits, resolver-error handling, and a hard subrequest budget.
 
 ## Local development
 
@@ -124,7 +124,9 @@ Request:
 }
 ```
 
-The advanced lookup supports A, AAAA, CAA, CERT, CNAME, DNSKEY, DS, IPSECKEY, LOC, MX, NS, NSEC, NSEC3PARAM, PTR, RRSIG, SOA, SRV, TLSA, and TXT. PTR accepts an IPv4 or IPv6 address and converts it to the corresponding reverse-DNS owner name. An empty answer is evidence that the requested record type was not returned; it is not automatically a configuration failure.
+The advanced lookup supports A, AAAA, CAA, CNAME, MX, NS, PTR, SOA, SRV, and TXT through Cloudflare's native DNS resolver. PTR accepts an IPv4 or IPv6 address and converts it to the corresponding reverse-DNS owner name. An empty answer is evidence that the requested record type was not returned; it is not automatically a configuration failure.
+
+DNSSEC and specialist resource-record inspection is not exposed by this native lookup surface. Broader DNSSEC support and infrastructure-dependent checks such as SMTP handshakes, blocklists, worldwide propagation comparisons, port reachability, and other network probes remain future work rather than implied capabilities of this endpoint.
 
 ## Repository layout
 
@@ -146,10 +148,10 @@ DMARC expresses a domain owner's requested handling policy. A receiver ultimatel
 
 ## Security and privacy
 
-- Scans query public DNS records only. Query names and record types are sent to Google Public DNS; no user-selectable resolver or target URL is accepted.
+- Scans query public DNS records only. Query names and record types are resolved by Cloudflare's native DNS service; no user-selectable resolver or target URL is accepted.
 - The MVP does not persist scan history in an application database.
 - DNS answers are untrusted input and are rendered as text.
-- The Worker fetches only a fixed DNS-over-HTTPS endpoint and does not fetch user-supplied URLs.
+- DNS lookups use the Worker's fixed native resolver and never fetch a user-supplied URL.
 - Security headers are applied by the Worker.
 - API requests have strict input and size limits.
 

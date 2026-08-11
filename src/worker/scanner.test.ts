@@ -45,6 +45,14 @@ describe("deterministic scan engine", () => {
     await expect(scanDomain("example.com", resolver)).rejects.toBeInstanceOf(ScanUpstreamError);
   });
 
+  it("does not offer a generic SPF record when the sender inventory is unknown", async () => {
+    const result = await scanDomain("example.com", new FakeResolver({}));
+    const finding = result.findings.find((candidate) => candidate.id === "spf-not-found");
+
+    expect(finding?.remediation?.record).toBeUndefined();
+    expect(finding?.remediation?.caution).toMatch(/verified sender inventory/iu);
+  });
+
   it("surfaces weaker sp and np policies without changing the organizational-domain posture", async () => {
     const strongPolicy = await scanWithDmarc(
       "v=DMARC1; p=reject; rua=mailto:dmarc@example.com",

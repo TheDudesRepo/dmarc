@@ -42,13 +42,13 @@ These controls are reported separately from DMARC policy. Missing optional contr
 
 ## Core DNS and advanced lookup
 
-The main scan also resolves A, AAAA, CNAME, TXT, MX, NS, SOA, and CAA. It flags evidence-backed delegation and owner-name conflicts without treating optional records or an email-only domain as broken. Advanced lookup exposes additional DNS and DNSSEC resource-record types one at a time. An empty advanced answer is not scored and is not automatically labeled an issue.
+The main scan also resolves A, AAAA, CNAME, TXT, MX, NS, SOA, and CAA. It flags evidence-backed delegation and owner-name conflicts without treating optional records or an email-only domain as broken. Advanced lookup exposes Cloudflare-native A, AAAA, CAA, CNAME, MX, NS, PTR, SOA, SRV, and TXT queries one at a time. An empty advanced answer is not scored and is not automatically labeled an issue.
 
-DNS JSON response codes are interpreted explicitly: NOERROR without the requested type and NXDOMAIN are empty results; SERVFAIL, REFUSED, transport errors, malformed responses, and timeouts remain indeterminate failures. TXT character-string chunks are joined only within one resource record, never across separate TXT records.
+The Worker uses Cloudflare's native DNS resolver. Resolver-reported absence is returned as an empty result; transport errors and timeouts remain indeterminate failures. The native interface does not expose authoritative-server consistency, raw DNS response codes, or DNSSEC validation state, so the scanner does not claim those checks. TXT character-string chunks are joined only within one resource record, never across separate TXT records.
 
 ## Remediation guidance
 
-Warnings and failures include ordered repair steps. When the intended value can be expressed safely, the result includes a copy-ready host, type, and value. Templates are conditional: for example, `v=spf1 -all` is only appropriate for a domain that must not send, and `0 .` is only appropriate for a domain that must not receive. The user must confirm sender inventory, mailbox/report destinations, provider-specific host formatting, and change-control requirements before publishing.
+Warnings and failures include ordered repair steps. When the intended value can be expressed safely, the result includes a DNS host, type, and value template. Templates are conditional: for example, `0 .` is only appropriate for a domain that must not receive mail. No generic SPF value is offered when the sender inventory is unknown. The user must confirm sender inventory, mailbox/report destinations, provider-specific host formatting, and change-control requirements before publishing.
 
 ## Configuration score
 

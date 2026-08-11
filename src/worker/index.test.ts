@@ -1,3 +1,4 @@
+import dns from "node:dns";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "./index";
 
@@ -17,7 +18,7 @@ describe("Worker API boundary", () => {
     const body = (await response.json()) as { status: string; version: string; deploymentId: string | null };
 
     expect(response.status).toBe(200);
-    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.2.0", deploymentId: null }));
+    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.2.1", deploymentId: null }));
     expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.headers.get("cache-control")).toContain("no-store");
@@ -102,28 +103,24 @@ describe("Worker API boundary", () => {
     { name: "localhost", type: "A" },
     { name: "https://example.com", type: "MX" },
     { name: "example.com", type: "ANY" },
+    { name: "example.com", type: "TLSA" },
+    { name: "example.com", type: "DNSKEY" },
     { name: "example.com", type: 16 },
   ])("rejects invalid lookup fields before resolving: $name $type", async (payload) => {
-    const dnsFetch = vi.spyOn(globalThis, "fetch");
+    const resolve4 = vi.spyOn(dns.promises, "resolve4");
+    const resolveMx = vi.spyOn(dns.promises, "resolveMx");
     const response = await lookupRequest(JSON.stringify(payload));
 
     expect(response.status).toBe(400);
-    expect(dnsFetch).not.toHaveBeenCalled();
+    expect(resolve4).not.toHaveBeenCalled();
+    expect(resolveMx).not.toHaveBeenCalled();
     await expect(response.json()).resolves.toEqual(expect.objectContaining({ code: "BAD_REQUEST" }));
   });
 
-  it("resolves an allowlisted type through the fixed DNS client and returns hardened record views", async () => {
-    const dnsFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-      const url = new URL(String(input));
-      expect(url.origin).toBe("https://dns.google");
-      expect(url.pathname).toBe("/resolve");
-      expect(url.searchParams.get("name")).toBe("example.com");
-      expect(url.searchParams.get("type")).toBe("15");
-      return dnsJson({
-        Status: 0,
-        Answer: [{ name: "example.com.", type: 15, TTL: 300, data: "10 mail.example.net." }],
-      });
-    });
+  it("resolves an allowlisted type through the fixed native DNS client and returns hardened record views", async () => {
+    const resolveMx = vi.spyOn(dns.promises, "resolveMx").mockResolvedValue([
+      { priority: 10, exchange: "mail.example.net." },
+    ]);
 
     const response = await lookupRequest(JSON.stringify({ name: "Example.COM.", type: "MX" }));
     const body = (await response.json()) as {
@@ -135,12 +132,13 @@ describe("Worker API boundary", () => {
     };
 
     expect(response.status).toBe(200);
-    expect(dnsFetch).toHaveBeenCalledTimes(1);
+    expect(resolveMx).toHaveBeenCalledOnce();
+    expect(resolveMx).toHaveBeenCalledWith("example.com");
     expect(body).toEqual(expect.objectContaining({
       input: "example.com",
       queryName: "example.com",
       type: "MX",
-      records: [{ name: "example.com", type: "MX", value: "10 mail.example.net", ttl: 300 }],
+      records: [{ name: "example.com", type: "MX", value: "10 mail.example.net" }],
       summary: "1 MX record returned for example.com.",
     }));
     expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
@@ -148,19 +146,12 @@ describe("Worker API boundary", () => {
   });
 
   it("converts PTR address input before resolving", async () => {
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-      const url = new URL(String(input));
-      expect(url.searchParams.get("name")).toBe("45.2.0.192.in-addr.arpa");
-      expect(url.searchParams.get("type")).toBe("12");
-      return dnsJson({
-        Status: 0,
-        Answer: [{ name: "45.2.0.192.in-addr.arpa.", type: 12, TTL: 60, data: "host.example.com." }],
-      });
-    });
+    const resolvePtr = vi.spyOn(dns.promises, "resolvePtr").mockResolvedValue(["host.example.com."]);
 
     const response = await lookupRequest(JSON.stringify({ name: "192.0.2.45", type: "PTR" }));
 
     expect(response.status).toBe(200);
+    expect(resolvePtr).toHaveBeenCalledWith("45.2.0.192.in-addr.arpa");
     await expect(response.json()).resolves.toEqual(expect.objectContaining({
       input: "192.0.2.45",
       queryName: "45.2.0.192.in-addr.arpa",
@@ -169,7 +160,7 @@ describe("Worker API boundary", () => {
   });
 
   it("returns an empty lookup as a successful result without inventing an issue", async () => {
-    vi.spyOn(globalThis, "fetch").mockImplementation(async () => dnsJson({ Status: 3 }));
+    vi.spyOn(dns.promises, "resolveTxt").mockResolvedValue([]);
     const response = await lookupRequest(JSON.stringify({ name: "_dmarc.example.com", type: "TXT" }));
     const body = (await response.json()) as { records: unknown[]; summary: string };
 
@@ -179,7 +170,8 @@ describe("Worker API boundary", () => {
   });
 
   it("maps resolver failures to a hardened 502 response", async () => {
-    vi.spyOn(globalThis, "fetch").mockImplementation(async () => dnsJson({ Status: 5 }));
+    const refusal = Object.assign(new Error("query refused"), { code: "EREFUSED" });
+    vi.spyOn(dns.promises, "resolve4").mockRejectedValue(refusal);
     const response = await lookupRequest(JSON.stringify({ name: "example.com", type: "A" }));
 
     expect(response.status).toBe(502);
@@ -197,11 +189,4 @@ function lookupRequest(body: string): Promise<Response> {
     }),
     env,
   );
-}
-
-function dnsJson(body: unknown): Response {
-  return new Response(JSON.stringify(body), {
-    status: 200,
-    headers: { "content-type": "application/dns-json" },
-  });
 }

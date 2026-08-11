@@ -80,21 +80,12 @@ export type DnsLookupType =
   | "A"
   | "AAAA"
   | "CAA"
-  | "CERT"
   | "CNAME"
-  | "DNSKEY"
-  | "DS"
-  | "IPSECKEY"
-  | "LOC"
   | "MX"
   | "NS"
-  | "NSEC"
-  | "NSEC3PARAM"
   | "PTR"
-  | "RRSIG"
   | "SOA"
   | "SRV"
-  | "TLSA"
   | "TXT";
 
 export interface DnsLookupResult {

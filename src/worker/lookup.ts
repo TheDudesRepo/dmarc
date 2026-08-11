@@ -19,23 +19,16 @@ export const DNS_LOOKUP_TYPES = [
   "A",
   "AAAA",
   "CAA",
-  "CERT",
   "CNAME",
-  "DNSKEY",
-  "DS",
-  "IPSECKEY",
-  "LOC",
   "MX",
   "NS",
-  "NSEC",
-  "NSEC3PARAM",
   "PTR",
-  "RRSIG",
   "SOA",
   "SRV",
-  "TLSA",
   "TXT",
 ] as const satisfies readonly DnsLookupType[];
+
+export type SupportedDnsLookupType = (typeof DNS_LOOKUP_TYPES)[number];
 
 const DNS_LOOKUP_TYPE_SET = new Set<string>(DNS_LOOKUP_TYPES);
 
@@ -46,7 +39,7 @@ export interface LookupResolver {
 export interface NormalizedLookupRequest {
   input: string;
   queryName: string;
-  type: DnsLookupType;
+  type: SupportedDnsLookupType;
 }
 
 export class LookupValidationError extends Error {
@@ -83,9 +76,8 @@ export async function lookupDns(
   let answers: DnsAnswer[];
   try {
     answers = await dns.query(request.queryName, request.type);
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : "DNS resolver failed without a typed error.";
-    throw new LookupUpstreamError(detail);
+  } catch {
+    throw new LookupUpstreamError("The DNS lookup could not be completed.");
   }
 
   const records = toRecordViews(answers);
@@ -105,11 +97,11 @@ export async function lookupDns(
   };
 }
 
-function normalizeLookupType(type: unknown): DnsLookupType {
+function normalizeLookupType(type: unknown): SupportedDnsLookupType {
   if (typeof type !== "string" || !DNS_LOOKUP_TYPE_SET.has(type)) {
     throw new LookupValidationError(`Type must be one of: ${DNS_LOOKUP_TYPES.join(", ")}.`);
   }
-  return type as DnsLookupType;
+  return type as SupportedDnsLookupType;
 }
 
 function normalizePublicOwnerName(input: unknown): string {

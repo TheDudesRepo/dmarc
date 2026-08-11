@@ -127,7 +127,7 @@ export async function scanDomain(domain: string, dns: DnsResolver = new DnsClien
     }
   }
 
-  const spf = analyzeSpf(domain, rootTxt, spfEstimate);
+  const spf = analyzeSpf(rootTxt, spfEstimate);
   const dkim = analyzeDkim(dkimDiscovery);
   const transport = analyzeTransport(domain, mx, mtaSts, tlsRpt);
   const dnsHealth = analyzeDnsHealth({ rootTxt, a, aaaa, mx, ns, cname, soa, caa });
@@ -671,7 +671,7 @@ function analyzeDmarc(domain: string, answers: DnsAnswer[]): DmarcAnalysis {
   };
 }
 
-function analyzeSpf(domain: string, rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | undefined): SpfAnalysis {
+function analyzeSpf(rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | undefined): SpfAnalysis {
   if (rootTxt.failed) {
     return {
       points: 0,
@@ -712,12 +712,7 @@ function analyzeSpf(domain: string, rootTxt: OptionalDnsResult, estimate: SpfLoo
               "Use each provider's documented include mechanism or approved IP ranges and combine them into one TXT record at the root.",
               "End with ~all during validation, then consider -all after mail-flow evidence confirms the inventory.",
             ],
-            record: {
-              name: domain,
-              type: "TXT",
-              value: "v=spf1 -all",
-            },
-            caution: "The copy-ready value is only correct when this domain must never send mail. Do not deploy it on an active sending domain.",
+            caution: "Do not publish a generic fallback policy. An active sending domain needs a policy built from its verified sender inventory; a non-sending domain requires an explicit business decision.",
           },
         },
       ],

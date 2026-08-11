@@ -3,30 +3,53 @@ import {
   DNS_TYPE_CODES,
   DnsClient,
   DnsQueryError,
-  type DnsFetch,
+  joinDnsTxtChunks,
   type DnsQueryType,
   type DnsTiming,
+  type NativeDnsResolver,
 } from "./dns";
 
-function dnsJson(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: { "content-type": "application/dns-json" },
-  });
+const MYAVISTA_SPF_WORKERD =
+  'v=spf1 include:u1791881.wl.sendgrid.net include:spf.protection.outlook.com include:aspmx.pardot.com ip4:198.181.21.221 ip4:198.181.21.222 ip4:198.181.30.101 ip4:198.251.0.114 ip4:198.251.4.1 ip4:198.251.4.2 ip4:198.251.4.3 ip4:198.251.4.4 ip4:198.251.4.5 " "include:_spf.salesforce.com -all';
+const MYAVISTA_SPF = MYAVISTA_SPF_WORKERD.replace('" "', "");
+
+const MYAVISTA_DKIM_WORKERD =
+  'v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp4ENNEyR6BISU0UPaRXz44n2tg77JdrU13T1VnMK+eEnPUzr4IRCO7vENNMEWUmBeDah2FInnxCQ5vro8cSjbAADlOcQSDj2M2F47H+SBn/EMZrOnHcT6I9KtiU6DboZGFkzVJt9IEW2TOmB/kMl2K7tJ2kCmwPeAO9L4TA3x+y2wSAu2WRv4onLxB0xNoR4n" "jeTiTgMalOLNi9xGVvPkCcrMG37XvCdZ/GqZfxLrkdgAhUWdoLwR5O+NDU9RWQnNOMFN1ysuDNQpkyxoU4J55PO61PdfKCYfs5cTk8eFt1Cc2tgY7QdzrrUAU5D3u6aE529Yy8I3paPGD0o8vxF1QIDAQAB;';
+const MYAVISTA_DKIM = MYAVISTA_DKIM_WORKERD.replace('" "', "");
+
+function nativeResolver(overrides: Partial<NativeDnsResolver> = {}): NativeDnsResolver {
+  return {
+    resolve4: async () => [],
+    resolve6: async () => [],
+    resolveCaa: async () => [],
+    resolveCname: async () => [],
+    resolveMx: async () => [],
+    resolveNs: async () => [],
+    resolvePtr: async () => [],
+    resolveSoa: async () => ({
+      nsname: "ns1.example.com",
+      hostmaster: "hostmaster.example.com",
+      serial: 1,
+      refresh: 7200,
+      retry: 3600,
+      expire: 1_209_600,
+      minttl: 300,
+    }),
+    resolveSrv: async () => [],
+    resolveTxt: async () => [],
+    ...overrides,
+  };
 }
 
-function flushMicrotasks(): Promise<void> {
-  return new Promise((resolve) => queueMicrotask(() => queueMicrotask(resolve)));
+function dnsError(code: string): Error & { code: string } {
+  return Object.assign(new Error(code), { code });
 }
 
-async function flushMicrotasksRepeatedly(count = 8): Promise<void> {
-  for (let index = 0; index < count; index += 1) await flushMicrotasks();
+async function flushMicrotasks(count = 4): Promise<void> {
+  for (let index = 0; index < count; index += 1) await Promise.resolve();
 }
 
-function manualClock(): {
-  timing: DnsTiming;
-  advance: (milliseconds: number) => void;
-} {
+function manualClock(): { timing: DnsTiming; advance: (milliseconds: number) => void } {
   let currentTime = 0;
   let nextHandle = 1;
   const timers = new Map<number, { due: number; callback: () => void }>();
@@ -46,10 +69,10 @@ function manualClock(): {
     },
     advance: (milliseconds) => {
       currentTime += milliseconds;
-      const dueTimers = [...timers.entries()]
+      const due = [...timers.entries()]
         .filter(([, timer]) => timer.due <= currentTime)
         .sort((left, right) => left[1].due - right[1].due);
-      for (const [handle, timer] of dueTimers) {
+      for (const [handle, timer] of due) {
         timers.delete(handle);
         timer.callback();
       }
@@ -57,28 +80,8 @@ function manualClock(): {
   };
 }
 
-describe("Google DNS JSON resolver", () => {
-  it("uses the fixed endpoint, a numeric validated type, and a normalized name", async () => {
-    const fetchMock = vi.fn<DnsFetch>(async () => dnsJson({ Status: 0 }));
-    const client = new DnsClient({ fetch: fetchMock });
-
-    await client.query("Example.COM.", "TXT");
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0] ?? [];
-    const requestUrl = new URL(url ?? "");
-    expect(requestUrl.origin + requestUrl.pathname).toBe("https://dns.google/resolve");
-    expect(requestUrl.searchParams.get("name")).toBe("example.com");
-    expect(requestUrl.searchParams.get("type")).toBe("16");
-    expect(init).toMatchObject({
-      method: "GET",
-      redirect: "error",
-      headers: { Accept: "application/dns-json" },
-    });
-    expect(init?.signal).toBeInstanceOf(AbortSignal);
-  });
-
-  it("supports the complete reusable query-type map", () => {
+describe("Cloudflare native DNS resolver", () => {
+  it("exposes exactly the ten RR types supported by Workerd's specific node:dns methods", () => {
     expect(DNS_TYPE_CODES).toEqual({
       A: 1,
       NS: 2,
@@ -88,247 +91,240 @@ describe("Google DNS JSON resolver", () => {
       MX: 15,
       TXT: 16,
       AAAA: 28,
-      LOC: 29,
       SRV: 33,
-      CERT: 37,
-      DS: 43,
-      IPSECKEY: 45,
-      RRSIG: 46,
-      NSEC: 47,
-      DNSKEY: 48,
-      NSEC3PARAM: 51,
-      TLSA: 52,
       CAA: 257,
     });
   });
 
-  it("preserves TXT RR boundaries and joins character-string chunks within each RR", async () => {
+  it("dispatches native record types and formats their evidence consistently", async () => {
+    const resolver = nativeResolver({
+      resolve4: async () => [{ address: "192.0.2.10", ttl: 60 }],
+      resolve6: async () => [{ address: "2001:db8::10", ttl: 120 }],
+      resolveCaa: async () => [{ critical: 0, issue: "letsencrypt.org" }],
+      resolveCname: async () => ["target.example.net."],
+      resolveMx: async () => [{ priority: 10, exchange: "mail.example.net." }],
+      resolveNs: async () => ["ns1.example.net."],
+      resolvePtr: async () => ["host.example.net."],
+      resolveSoa: async () => ({
+        nsname: "ns1.example.net.",
+        hostmaster: "hostmaster.example.net.",
+        serial: 2026081101,
+        refresh: 7200,
+        retry: 3600,
+        expire: 1_209_600,
+        minttl: 300,
+      }),
+      resolveSrv: async () => [{ priority: 10, weight: 5, port: 443, name: "service.example.net." }],
+      resolveTxt: async () => [["v=spf1 ", "-all"]],
+    });
+    const client = new DnsClient({ resolver });
+
+    await expect(client.query("Example.COM.", "A")).resolves.toEqual([
+      { name: "example.com", type: "A", ttl: 60, data: "192.0.2.10" },
+    ]);
+    await expect(client.query("example.com", "AAAA")).resolves.toEqual([
+      { name: "example.com", type: "AAAA", ttl: 120, data: "2001:db8::10" },
+    ]);
+    await expect(client.query("example.com", "CAA")).resolves.toEqual([
+      { name: "example.com", type: "CAA", data: '0 issue "letsencrypt.org"' },
+    ]);
+    await expect(client.query("example.com", "CNAME")).resolves.toEqual([
+      { name: "example.com", type: "CNAME", data: "target.example.net" },
+    ]);
+    await expect(client.query("example.com", "MX")).resolves.toEqual([
+      { name: "example.com", type: "MX", data: "10 mail.example.net" },
+    ]);
+    await expect(client.query("example.com", "NS")).resolves.toEqual([
+      { name: "example.com", type: "NS", data: "ns1.example.net" },
+    ]);
+    await expect(client.query("1.2.0.192.in-addr.arpa", "PTR")).resolves.toEqual([
+      { name: "1.2.0.192.in-addr.arpa", type: "PTR", data: "host.example.net" },
+    ]);
+    await expect(client.query("example.com", "SOA")).resolves.toEqual([
+      {
+        name: "example.com",
+        type: "SOA",
+        data: "ns1.example.net hostmaster.example.net 2026081101 7200 3600 1209600 300",
+      },
+    ]);
+    await expect(client.query("_https._tcp.example.com", "SRV")).resolves.toEqual([
+      { name: "_https._tcp.example.com", type: "SRV", data: "10 5 443 service.example.net" },
+    ]);
+    await expect(client.query("example.com", "TXT")).resolves.toEqual([
+      { name: "example.com", type: "TXT", data: "v=spf1 -all" },
+    ]);
+  });
+
+  it("repairs the exact myavista.com SPF quote-boundary artifact", async () => {
     const client = new DnsClient({
-      fetch: async () =>
-        dnsJson({
-          Status: 0,
-          Answer: [
-            { name: "example.com.", type: 16, TTL: 300, data: '"first" "second"' },
-            { name: "example.com.", type: 16, TTL: 120, data: '"third"' },
-            { name: "example.com.", type: 5, TTL: 60, data: "alias.example.net." },
-          ],
-        }),
+      resolver: nativeResolver({ resolveTxt: async () => [[MYAVISTA_SPF_WORKERD]] }),
+    });
+
+    await expect(client.query("myavista.com", "TXT")).resolves.toEqual([
+      { name: "myavista.com", type: "TXT", data: MYAVISTA_SPF },
+    ]);
+    expect(joinDnsTxtChunks([MYAVISTA_SPF.slice(0, -35), MYAVISTA_SPF.slice(-35)])).toBe(
+      MYAVISTA_SPF,
+    );
+  });
+
+  it("repairs the exact selector1 MyAvista DKIM quote-boundary artifact", async () => {
+    const client = new DnsClient({
+      resolver: nativeResolver({ resolveTxt: async () => [[MYAVISTA_DKIM_WORKERD]] }),
+    });
+
+    await expect(client.query("selector1._domainkey.myavista.com", "TXT")).resolves.toEqual([
+      { name: "selector1._domainkey.myavista.com", type: "TXT", data: MYAVISTA_DKIM },
+    ]);
+  });
+
+  it("preserves separate TXT RRs and does not alter literal quotes in unrelated TXT data", async () => {
+    const client = new DnsClient({
+      resolver: nativeResolver({
+        resolveTxt: async () => [
+          ["v=spf1 ", "-all"],
+          ['site-verification=literal" "value'],
+        ],
+      }),
     });
 
     await expect(client.query("example.com", "TXT")).resolves.toEqual([
-      { name: "example.com", type: "TXT", ttl: 300, data: "firstsecond" },
-      { name: "example.com", type: "TXT", ttl: 120, data: "third" },
+      { name: "example.com", type: "TXT", data: "v=spf1 -all" },
+      { name: "example.com", type: "TXT", data: 'site-verification=literal" "value' },
     ]);
   });
 
-  it.each([
-    ["MX", "10 mail.example.com.", "10 mail.example.com"],
-    ["NS", "ns1.example.com.", "ns1.example.com"],
-    ["CNAME", "target.example.com.", "target.example.com"],
-    ["SOA", "ns1.example.com. hostmaster.example.com. 1 7200 3600 1209600 300", "ns1.example.com hostmaster.example.com 1 7200 3600 1209600 300"],
-    ["SRV", "10 5 443 service.example.com.", "10 5 443 service.example.com"],
-    ["PTR", "host.example.com.", "host.example.com"],
-    ["CAA", '0 issue "letsencrypt.org"', '0 issue "letsencrypt.org"'],
-  ] satisfies Array<[DnsQueryType, string, string]>)
-  ("formats %s data readably while retaining the owner and TTL", async (type, data, expected) => {
-    const client = new DnsClient({
-      fetch: async () =>
-        dnsJson({
-          Status: 0,
-          Answer: [{ name: "Example.COM.", type: DNS_TYPE_CODES[type], TTL: 600, data }],
-        }),
-    });
+  it.each(["ENODATA", "ENOTFOUND", "NXDOMAIN"])(
+    "maps %s to an absent RR set",
+    async (code) => {
+      const client = new DnsClient({
+        resolver: nativeResolver({ resolveTxt: async () => Promise.reject(dnsError(code)) }),
+      });
+      await expect(client.query("missing.example", "TXT")).resolves.toEqual([]);
+    },
+  );
 
-    await expect(client.query("example.com", type)).resolves.toEqual([
-      { name: "example.com", type, ttl: 600, data: expected },
+  it("retries a quick transient native resolver error once", async () => {
+    const resolveTxt = vi
+      .fn<NativeDnsResolver["resolveTxt"]>()
+      .mockRejectedValueOnce(dnsError("ESERVFAIL"))
+      .mockResolvedValueOnce([["v=spf1 -all"]]);
+    const client = new DnsClient({ resolver: nativeResolver({ resolveTxt }) });
+
+    await expect(client.query("example.com", "TXT")).resolves.toEqual([
+      { name: "example.com", type: "TXT", data: "v=spf1 -all" },
     ]);
+    expect(resolveTxt).toHaveBeenCalledTimes(2);
   });
 
-  it("treats NOERROR without the requested RR and NXDOMAIN as absence", async () => {
-    const noData = new DnsClient({
-      fetch: async () =>
-        dnsJson({
-          Status: 0,
-          Answer: [{ name: "example.com.", type: 5, TTL: 60, data: "alias.example.net." }],
-        }),
-    });
-    const noDomain = new DnsClient({ fetch: async () => dnsJson({ Status: 3 }) });
-
-    await expect(noData.query("example.com", "TXT")).resolves.toEqual([]);
-    await expect(noDomain.query("missing.example", "TXT")).resolves.toEqual([]);
-  });
-
-  it("retries SERVFAIL once but never converts it to absence", async () => {
-    const fetchMock = vi.fn<DnsFetch>(async () => dnsJson({ Status: 2 }));
-    const client = new DnsClient({ fetch: fetchMock });
-
-    await expect(client.query("example.com", "TXT")).rejects.toThrow(/SERVFAIL/u);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
-  it.each([
-    [5, "REFUSED"],
-    [1, "DNS status 1"],
-  ])("rejects DNS status %i without retrying", async (status, message) => {
-    const fetchMock = vi.fn<DnsFetch>(async () => dnsJson({ Status: status }));
-    const client = new DnsClient({ fetch: fetchMock });
-
-    await expect(client.query("example.com", "TXT")).rejects.toThrow(message);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("retries a transient HTTP failure within the same query budget", async () => {
-    const fetchMock = vi
-      .fn<DnsFetch>()
-      .mockResolvedValueOnce(dnsJson({ error: "temporary" }, 503))
-      .mockResolvedValueOnce(dnsJson({ Status: 0 }));
-    const client = new DnsClient({ fetch: fetchMock });
-
-    await expect(client.query("example.com", "TXT")).resolves.toEqual([]);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("rejects non-transient HTTP failures without retrying", async () => {
-    const fetchMock = vi.fn<DnsFetch>(async () => dnsJson({ error: "bad request" }, 400));
-    const client = new DnsClient({ fetch: fetchMock });
-
-    await expect(client.query("example.com", "TXT")).rejects.toThrow(/HTTP 400/u);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("retries malformed JSON once, then returns a typed resolver error", async () => {
-    const fetchMock = vi.fn<DnsFetch>(async () => new Response("{", { status: 200 }));
-    const client = new DnsClient({ fetch: fetchMock });
-
-    const result = client.query("example.com", "TXT").catch((error: unknown) => error);
-    expect(await result).toBeInstanceOf(DnsQueryError);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("rejects oversized DNS JSON before parsing or retrying", async () => {
-    const fetchMock = vi.fn<DnsFetch>(async () =>
-      new Response("{}", {
-        status: 200,
-        headers: { "content-length": "262145" },
-      }),
+  it("does not retry REFUSED and never converts it to absence", async () => {
+    const resolveTxt = vi.fn<NativeDnsResolver["resolveTxt"]>(async () =>
+      Promise.reject(dnsError("EREFUSED")),
     );
-    const client = new DnsClient({ fetch: fetchMock });
+    const client = new DnsClient({ resolver: nativeResolver({ resolveTxt }) });
 
-    await expect(client.query("example.com", "TXT")).rejects.toThrow(/safety limit/u);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(client.query("example.com", "TXT")).rejects.toThrow(/REFUSED/u);
+    expect(resolveTxt).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects implausibly large answer sets", async () => {
-    const fetchMock = vi.fn<DnsFetch>(async () =>
-      dnsJson({
-        Status: 0,
-        Answer: Array.from({ length: 257 }, () => ({
-          name: "example.com.",
-          type: 16,
-          TTL: 60,
-          data: '"value"',
-        })),
-      }),
-    );
-    const client = new DnsClient({ fetch: fetchMock });
-
-    await expect(client.query("example.com", "TXT")).rejects.toThrow(/safety limit/u);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("bounds both timed-out attempts inside one injected overall deadline", async () => {
+  it("bounds a stalled native query to one overall deadline", async () => {
     const clock = manualClock();
-    const signals: AbortSignal[] = [];
-    const fetchMock = vi.fn<DnsFetch>(
-      async (_url, init) =>
-        new Promise<Response>(() => {
-          if (init.signal) signals.push(init.signal);
-        }),
+    const resolveTxt = vi.fn<NativeDnsResolver["resolveTxt"]>(
+      async () => new Promise<string[][]>(() => undefined),
     );
-    const client = new DnsClient({ fetch: fetchMock, timing: clock.timing, timeoutMs: 100 });
+    const client = new DnsClient({
+      resolver: nativeResolver({ resolveTxt }),
+      timing: clock.timing,
+      timeoutMs: 100,
+    });
     const result = client.query("example.com", "TXT").catch((error: unknown) => error);
 
     await flushMicrotasks();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    clock.advance(50);
-    await flushMicrotasks();
-    await flushMicrotasks();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(signals[0]?.aborted).toBe(true);
-
-    clock.advance(50);
+    expect(resolveTxt).toHaveBeenCalledTimes(1);
+    clock.advance(100);
     const error = await result;
     expect(error).toBeInstanceOf(DnsQueryError);
     expect((error as Error).message).toMatch(/timed out/u);
-    expect(signals[1]?.aborted).toBe(true);
+    expect(resolveTxt).toHaveBeenCalledTimes(1);
   });
 
-  it("caches each normalized name and type, including in-flight work", async () => {
-    const fetchMock = vi.fn<DnsFetch>(async () => dnsJson({ Status: 0 }));
-    const client = new DnsClient({ fetch: fetchMock });
+  it("caches normalized in-flight queries", async () => {
+    const resolveTxt = vi.fn<NativeDnsResolver["resolveTxt"]>(async () => []);
+    const client = new DnsClient({ resolver: nativeResolver({ resolveTxt }) });
 
     const first = client.query("Example.COM.", "TXT");
     const second = client.query("example.com", "TXT");
-
     expect(second).toBe(first);
-    await expect(first).resolves.toEqual([]);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await first;
+    expect(resolveTxt).toHaveBeenCalledTimes(1);
   });
 
-  it("counts retries as actual subrequests and never exceeds 48", async () => {
-    const fetchMock = vi.fn<DnsFetch>(async (url) => {
-      const name = new URL(url).searchParams.get("name");
-      return dnsJson({ Status: name === "retry.example" ? 2 : 0 });
+  it("counts retries as native subrequests and never exceeds 48", async () => {
+    const resolveTxt = vi.fn<NativeDnsResolver["resolveTxt"]>(async (name) => {
+      if (name === "retry.example") throw dnsError("ESERVFAIL");
+      return [];
     });
-    const client = new DnsClient({ fetch: fetchMock });
+    const client = new DnsClient({ resolver: nativeResolver({ resolveTxt }) });
 
-    await Promise.all(
-      Array.from({ length: 47 }, (_, index) => client.query(`host${index}.example`, "TXT")),
-    );
+    await Promise.all(Array.from({ length: 47 }, (_, index) => client.query(`host${index}.example`, "TXT")));
     await expect(client.query("retry.example", "TXT")).rejects.toThrow(/safety limit/u);
     await expect(client.query("blocked.example", "TXT")).rejects.toThrow(/safety limit/u);
-    expect(fetchMock).toHaveBeenCalledTimes(48);
+    expect(resolveTxt).toHaveBeenCalledTimes(48);
   });
 
-  it("queues lookups above the Worker outbound-connection limit", async () => {
+  it("queues native lookups above the six-connection Worker limit", async () => {
     let active = 0;
     let maximumActive = 0;
     const releases: Array<() => void> = [];
-    const fetchMock = vi.fn<DnsFetch>(
+    const resolveTxt = vi.fn<NativeDnsResolver["resolveTxt"]>(
       async () =>
-        new Promise<Response>((resolve) => {
+        new Promise<string[][]>((resolve) => {
           active += 1;
           maximumActive = Math.max(maximumActive, active);
           releases.push(() => {
             active -= 1;
-            resolve(dnsJson({ Status: 0 }));
+            resolve([]);
           });
         }),
     );
-    const client = new DnsClient({ fetch: fetchMock });
+    const client = new DnsClient({ resolver: nativeResolver({ resolveTxt }) });
     const lookups = Array.from({ length: 10 }, (_, index) => client.query(`host${index}.example`, "TXT"));
 
     await flushMicrotasks();
-    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(resolveTxt).toHaveBeenCalledTimes(6);
     expect(maximumActive).toBe(6);
-
     for (const release of releases.splice(0, 6)) release();
-    await flushMicrotasksRepeatedly();
-    expect(fetchMock).toHaveBeenCalledTimes(10);
+    await flushMicrotasks(12);
+    expect(resolveTxt).toHaveBeenCalledTimes(10);
     expect(maximumActive).toBe(6);
-
     for (const release of releases.splice(0)) release();
     await expect(Promise.all(lookups)).resolves.toHaveLength(10);
   });
 
-  it("rejects invalid names, types, and timeout configuration before fetching", () => {
-    const fetchMock = vi.fn<DnsFetch>(async () => dnsJson({ Status: 0 }));
-    const client = new DnsClient({ fetch: fetchMock });
+  it("rejects malformed or oversized native responses", async () => {
+    const malformed = new DnsClient({
+      resolver: nativeResolver({
+        resolveMx: async () => [{ priority: -1, exchange: "mail.example" }],
+      }),
+    });
+    const oversized = new DnsClient({
+      resolver: nativeResolver({
+        resolveTxt: async () => Array.from({ length: 257 }, () => ["value"]),
+      }),
+    });
+
+    await expect(malformed.query("example.com", "MX")).rejects.toThrow(/malformed MX/u);
+    await expect(oversized.query("example.com", "TXT")).rejects.toThrow(/malformed response data/u);
+  });
+
+  it("rejects invalid names, unsupported types, and timeout configuration before resolving", () => {
+    const resolveTxt = vi.fn<NativeDnsResolver["resolveTxt"]>(async () => []);
+    const client = new DnsClient({ resolver: nativeResolver({ resolveTxt }) });
 
     expect(() => client.query("https://example.com", "TXT")).toThrow(/invalid DNS query name/u);
     expect(() => client.query("-bad.example", "TXT")).toThrow(/invalid DNS query name/u);
-    expect(() => client.query("example.com", "ANY" as DnsQueryType)).toThrow(/invalid DNS query type/u);
+    expect(() => client.query("example.com", "DNSKEY" as DnsQueryType)).toThrow(/unsupported DNS query type/u);
     expect(() => new DnsClient({ timeoutMs: 0 })).toThrow(/invalid DNS timeout/u);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(resolveTxt).not.toHaveBeenCalled();
   });
 });

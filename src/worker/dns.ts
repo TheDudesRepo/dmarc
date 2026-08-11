@@ -1,5 +1,13 @@
+import dns, {
+  type CaaRecord,
+  type MxRecord,
+  type RecordWithTtl,
+  type SoaRecord,
+  type SrvRecord,
+} from "node:dns";
 import type { DnsRecordView } from "../shared/types";
 
+/** RR types exposed by Workerd's specific node:dns resolver methods. */
 export const DNS_TYPE_CODES = {
   A: 1,
   NS: 2,
@@ -9,28 +17,18 @@ export const DNS_TYPE_CODES = {
   MX: 15,
   TXT: 16,
   AAAA: 28,
-  LOC: 29,
   SRV: 33,
-  CERT: 37,
-  DS: 43,
-  IPSECKEY: 45,
-  RRSIG: 46,
-  NSEC: 47,
-  DNSKEY: 48,
-  NSEC3PARAM: 51,
-  TLSA: 52,
   CAA: 257,
 } as const;
 
 export type DnsQueryType = keyof typeof DNS_TYPE_CODES;
 
-const DNS_ENDPOINT = "https://dns.google/resolve";
 const DNS_TIMEOUT_MS = 4_500;
 const MAX_DNS_SUBREQUESTS = 48;
 const MAX_ATTEMPTS = 2;
 const MAX_CONCURRENT_DNS_QUERIES = 6;
-const MAX_DNS_RESPONSE_BYTES = 262_144;
 const MAX_DNS_ANSWERS = 256;
+const MAX_DNS_RESULT_CHARACTERS = 262_144;
 
 export interface DnsAnswer {
   name: string;
@@ -39,7 +37,19 @@ export interface DnsAnswer {
   data: string;
 }
 
-export type DnsFetch = (url: string, init: RequestInit) => Promise<Response>;
+/** Injectable subset of node:dns used by the Worker. */
+export interface NativeDnsResolver {
+  resolve4(name: string, options: { ttl: true }): Promise<RecordWithTtl[]>;
+  resolve6(name: string, options: { ttl: true }): Promise<RecordWithTtl[]>;
+  resolveCaa(name: string): Promise<CaaRecord[]>;
+  resolveCname(name: string): Promise<string[]>;
+  resolveMx(name: string): Promise<MxRecord[]>;
+  resolveNs(name: string): Promise<string[]>;
+  resolvePtr(name: string): Promise<string[]>;
+  resolveSoa(name: string): Promise<SoaRecord>;
+  resolveSrv(name: string): Promise<SrvRecord[]>;
+  resolveTxt(name: string): Promise<string[][]>;
+}
 
 export interface DnsTiming {
   now: () => number;
@@ -48,7 +58,7 @@ export interface DnsTiming {
 }
 
 export interface DnsClientOptions {
-  fetch?: DnsFetch;
+  resolver?: NativeDnsResolver;
   timing?: DnsTiming;
   timeoutMs?: number;
 }
@@ -70,7 +80,7 @@ const DEFAULT_TIMING: DnsTiming = {
 
 export class DnsClient {
   private readonly cache = new Map<string, Promise<DnsAnswer[]>>();
-  private readonly fetchImpl: DnsFetch;
+  private readonly resolver: NativeDnsResolver;
   private readonly timing: DnsTiming;
   private readonly timeoutMs: number;
   private subrequestCount = 0;
@@ -78,19 +88,19 @@ export class DnsClient {
   private readonly queryWaiters: Array<() => void> = [];
 
   constructor(options: DnsClientOptions = {}) {
-    this.fetchImpl = options.fetch ?? ((url, init) => globalThis.fetch(url, init));
+    this.resolver = options.resolver ?? dns.promises;
     this.timing = options.timing ?? DEFAULT_TIMING;
     this.timeoutMs = normalizeTimeout(options.timeoutMs);
   }
 
   query(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
     const safeName = normalizeDnsQueryName(name);
-    const typeCode = getDnsTypeCode(type);
+    validateDnsQueryType(type);
     const cacheKey = `${type}:${safeName}`;
     const cached = this.cache.get(cacheKey);
     if (cached) return cached;
 
-    const query = this.withQuerySlot(() => this.fetchQuery(safeName, type, typeCode));
+    const query = this.withQuerySlot(() => this.resolveQuery(safeName, type));
     this.cache.set(cacheKey, query);
     return query;
   }
@@ -124,113 +134,74 @@ export class DnsClient {
     if (next) next();
   }
 
-  private async fetchQuery(name: string, type: DnsQueryType, typeCode: number): Promise<DnsAnswer[]> {
+  private async resolveQuery(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
     const deadline = this.timing.now() + this.timeoutMs;
-    let lastError: DnsQueryError | undefined;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       const remainingMs = deadline - this.timing.now();
-      if (remainingMs <= 0) {
-        throw new DnsQueryError("DNS resolver timed out.");
-      }
-
-      // Reserve time for the retry so one stalled request cannot consume the
-      // entire query budget before a second attempt can begin.
-      const attemptsRemaining = MAX_ATTEMPTS - attempt;
-      const attemptBudgetMs = Math.max(1, Math.floor(remainingMs / attemptsRemaining));
+      if (remainingMs <= 0) throw new DnsQueryError("DNS resolver timed out.");
 
       try {
-        return await this.fetchAttempt(name, type, typeCode, attemptBudgetMs);
+        return await this.resolveAttempt(name, type, remainingMs);
       } catch (error) {
-        const dnsError = asDnsQueryError(error);
-        lastError = dnsError;
+        if (isDnsAbsenceError(error)) return [];
+
+        const dnsError = normalizeDnsError(error);
         if (!(dnsError instanceof RetryableDnsQueryError) || attempt === MAX_ATTEMPTS - 1) {
           throw new DnsQueryError(dnsError.message);
         }
       }
     }
 
-    throw lastError ?? new DnsQueryError("DNS resolver could not be reached.");
+    throw new DnsQueryError("DNS resolver could not be reached.");
   }
 
-  private async fetchAttempt(
-    name: string,
-    type: DnsQueryType,
-    typeCode: number,
-    timeoutMs: number,
-  ): Promise<DnsAnswer[]> {
+  private async resolveAttempt(name: string, type: DnsQueryType, timeoutMs: number): Promise<DnsAnswer[]> {
     if (this.subrequestCount >= MAX_DNS_SUBREQUESTS) {
       throw new DnsQueryError("The DNS lookup safety limit was reached.");
     }
     this.subrequestCount += 1;
 
-    const url = new URL(DNS_ENDPOINT);
-    url.searchParams.set("name", name);
-    url.searchParams.set("type", String(typeCode));
-
-    const controller = new AbortController();
     let timeoutHandle: unknown;
     const timeout = new Promise<never>((_, reject) => {
-      timeoutHandle = this.timing.setTimeout(() => {
-        controller.abort();
-        reject(new RetryableDnsQueryError("DNS resolver timed out."));
-      }, timeoutMs);
+      timeoutHandle = this.timing.setTimeout(
+        () => reject(new DnsQueryError("DNS resolver timed out.")),
+        timeoutMs,
+      );
     });
 
-    const request = this.performRequest(url.toString(), controller.signal, name, type, typeCode);
-
     try {
-      return await Promise.race([request, timeout]);
-    } catch (error) {
-      if (error instanceof DnsQueryError) throw error;
-      throw new RetryableDnsQueryError("DNS resolver could not be reached.");
+      const answers = await Promise.race([this.resolveNative(name, type), timeout]);
+      validateAnswerSet(answers);
+      return answers;
     } finally {
       if (timeoutHandle !== undefined) this.timing.clearTimeout(timeoutHandle);
     }
   }
 
-  private async performRequest(
-    url: string,
-    signal: AbortSignal,
-    queryName: string,
-    queryType: DnsQueryType,
-    queryTypeCode: number,
-  ): Promise<DnsAnswer[]> {
-    let response: Response;
-    try {
-      response = await this.fetchImpl(url, {
-        method: "GET",
-        headers: { Accept: "application/dns-json" },
-        redirect: "error",
-        signal,
-      });
-    } catch {
-      throw new RetryableDnsQueryError("DNS resolver could not be reached.");
+  private async resolveNative(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
+    switch (type) {
+      case "A":
+        return formatAddressAnswers(name, type, await this.resolver.resolve4(name, { ttl: true }));
+      case "AAAA":
+        return formatAddressAnswers(name, type, await this.resolver.resolve6(name, { ttl: true }));
+      case "CAA":
+        return formatCaaAnswers(name, await this.resolver.resolveCaa(name));
+      case "CNAME":
+        return formatNameAnswers(name, type, await this.resolver.resolveCname(name));
+      case "MX":
+        return formatMxAnswers(name, await this.resolver.resolveMx(name));
+      case "NS":
+        return formatNameAnswers(name, type, await this.resolver.resolveNs(name));
+      case "PTR":
+        return formatNameAnswers(name, type, await this.resolver.resolvePtr(name));
+      case "SOA":
+        return [formatSoaAnswer(name, await this.resolver.resolveSoa(name))];
+      case "SRV":
+        return formatSrvAnswers(name, await this.resolver.resolveSrv(name));
+      case "TXT":
+        return formatTxtAnswers(name, await this.resolver.resolveTxt(name));
     }
-
-    if (!response.ok) {
-      const ErrorType = isRetryableHttpStatus(response.status) ? RetryableDnsQueryError : DnsQueryError;
-      throw new ErrorType(`DNS resolver returned HTTP ${response.status}.`);
-    }
-
-    const declaredLength = Number(response.headers.get("content-length") ?? "0");
-    if (Number.isFinite(declaredLength) && declaredLength > MAX_DNS_RESPONSE_BYTES) {
-      throw new DnsQueryError("DNS resolver response exceeded the safety limit.");
-    }
-
-    let payload: unknown;
-    try {
-      const body = await response.text();
-      if (new TextEncoder().encode(body).byteLength > MAX_DNS_RESPONSE_BYTES) {
-        throw new DnsQueryError("DNS resolver response exceeded the safety limit.");
-      }
-      payload = JSON.parse(body) as unknown;
-    } catch (error) {
-      if (error instanceof DnsQueryError) throw error;
-      throw new RetryableDnsQueryError("DNS resolver returned a malformed response.");
-    }
-
-    return parseDnsResponse(payload, queryName, queryType, queryTypeCode);
   }
 }
 
@@ -243,7 +214,22 @@ export function toRecordViews(answers: DnsAnswer[]): DnsRecordView[] {
   }));
 }
 
-/** Decode one TXT RR from the quoted presentation form returned by DNS JSON APIs. */
+/**
+ * Join the character-strings within one TXT RR. Workerd currently sometimes
+ * returns Cloudflare JSON presentation boundaries (`" "`) inside a single
+ * chunk. Email-authentication records cannot contain that syntax, so remove it
+ * only for the structured records this scanner consumes.
+ */
+export function joinDnsTxtChunks(chunks: readonly string[]): string {
+  if (!Array.isArray(chunks) || chunks.some((chunk) => typeof chunk !== "string")) {
+    throw new DnsQueryError("DNS resolver returned malformed TXT data.");
+  }
+
+  const joined = chunks.join("");
+  return isStructuredEmailTxt(joined) ? joined.replace(/"\s+"/gu, "") : joined;
+}
+
+/** Decode quoted DNS presentation data retained for parser and fixture compatibility. */
 export function decodeDnsTxt(data: string): string {
   const value = data.trim();
   if (!value.startsWith('"')) return value;
@@ -294,102 +280,137 @@ export function decodeDnsTxt(data: string): string {
   return sawQuotedChunk ? result : value;
 }
 
-function parseDnsResponse(
-  payload: unknown,
-  queryName: string,
-  queryType: DnsQueryType,
-  queryTypeCode: number,
-): DnsAnswer[] {
-  if (!isObject(payload) || !Number.isInteger(payload.Status)) {
-    throw new RetryableDnsQueryError("DNS resolver returned a malformed response.");
+function formatAddressAnswers(name: string, type: "A" | "AAAA", records: RecordWithTtl[]): DnsAnswer[] {
+  assertArray(records);
+  return records.map((record) => {
+    if (!isObject(record) || typeof record.address !== "string" || !isValidTtl(record.ttl)) {
+      throw new DnsQueryError("DNS resolver returned malformed address data.");
+    }
+    return { name, type, ttl: record.ttl, data: record.address };
+  });
+}
+
+function formatNameAnswers(name: string, type: "CNAME" | "NS" | "PTR", records: string[]): DnsAnswer[] {
+  assertStringArray(records);
+  return records.map((record) => ({ name, type, data: stripFinalDot(record) }));
+}
+
+function formatMxAnswers(name: string, records: MxRecord[]): DnsAnswer[] {
+  assertArray(records);
+  return records.map((record) => {
+    if (!isObject(record) || !isUnsignedInteger(record.priority) || typeof record.exchange !== "string") {
+      throw new DnsQueryError("DNS resolver returned malformed MX data.");
+    }
+    return { name, type: "MX", data: `${record.priority} ${stripFinalDot(record.exchange)}` };
+  });
+}
+
+function formatCaaAnswers(name: string, records: CaaRecord[]): DnsAnswer[] {
+  assertArray(records);
+  return records.map((record) => {
+    if (!isObject(record) || !isUnsignedInteger(record.critical) || record.critical > 255) {
+      throw new DnsQueryError("DNS resolver returned malformed CAA data.");
+    }
+
+    const tag = ["issue", "issuewild", "iodef", "contactemail", "contactphone"].find(
+      (candidate) => typeof record[candidate as keyof CaaRecord] === "string",
+    ) as keyof CaaRecord | undefined;
+    const value = tag === undefined ? undefined : record[tag];
+    if (tag === undefined || typeof value !== "string") {
+      throw new DnsQueryError("DNS resolver returned malformed CAA data.");
+    }
+
+    return {
+      name,
+      type: "CAA",
+      data: `${record.critical} ${String(tag)} "${escapeQuotedValue(value)}"`,
+    };
+  });
+}
+
+function formatSoaAnswer(name: string, record: SoaRecord): DnsAnswer {
+  if (
+    !isObject(record) ||
+    typeof record.nsname !== "string" ||
+    typeof record.hostmaster !== "string" ||
+    !isUnsignedInteger(record.serial) ||
+    !isUnsignedInteger(record.refresh) ||
+    !isUnsignedInteger(record.retry) ||
+    !isUnsignedInteger(record.expire) ||
+    !isUnsignedInteger(record.minttl)
+  ) {
+    throw new DnsQueryError("DNS resolver returned malformed SOA data.");
   }
 
-  const status = payload.Status as number;
-  if (status === 3) return [];
-  if (status === 2) throw new RetryableDnsQueryError("DNS resolver returned SERVFAIL.");
-  if (status !== 0) {
-    const label = status === 5 ? "REFUSED" : `DNS status ${status}`;
-    throw new DnsQueryError(`DNS resolver returned ${label}.`);
-  }
+  return {
+    name,
+    type: "SOA",
+    data: [
+      stripFinalDot(record.nsname),
+      stripFinalDot(record.hostmaster),
+      record.serial,
+      record.refresh,
+      record.retry,
+      record.expire,
+      record.minttl,
+    ].join(" "),
+  };
+}
 
-  if (payload.Answer === undefined || payload.Answer === null) return [];
-  if (!Array.isArray(payload.Answer)) {
-    throw new RetryableDnsQueryError("DNS resolver returned a malformed response.");
-  }
-  if (payload.Answer.length > MAX_DNS_ANSWERS) {
+function formatSrvAnswers(name: string, records: SrvRecord[]): DnsAnswer[] {
+  assertArray(records);
+  return records.map((record) => {
+    if (
+      !isObject(record) ||
+      !isUnsignedInteger(record.priority) ||
+      !isUnsignedInteger(record.weight) ||
+      !isUnsignedInteger(record.port) ||
+      typeof record.name !== "string"
+    ) {
+      throw new DnsQueryError("DNS resolver returned malformed SRV data.");
+    }
+    return {
+      name,
+      type: "SRV",
+      data: `${record.priority} ${record.weight} ${record.port} ${stripFinalDot(record.name)}`,
+    };
+  });
+}
+
+function formatTxtAnswers(name: string, records: string[][]): DnsAnswer[] {
+  assertArray(records);
+  return records.map((chunks) => ({ name, type: "TXT", data: joinDnsTxtChunks(chunks) }));
+}
+
+function validateAnswerSet(answers: DnsAnswer[]): void {
+  if (!Array.isArray(answers) || answers.length > MAX_DNS_ANSWERS) {
     throw new DnsQueryError("DNS resolver response exceeded the safety limit.");
   }
 
-  const answers: DnsAnswer[] = [];
-  for (const item of payload.Answer) {
-    if (!isDnsJsonAnswer(item)) {
-      throw new RetryableDnsQueryError("DNS resolver returned a malformed response.");
+  let characters = 0;
+  for (const answer of answers) {
+    characters += answer.name.length + answer.data.length;
+    if (characters > MAX_DNS_RESULT_CHARACTERS) {
+      throw new DnsQueryError("DNS resolver response exceeded the safety limit.");
     }
-    if (item.type !== queryTypeCode) continue;
-
-    answers.push({
-      name: formatOwnerName(item.name || queryName),
-      type: queryType,
-      ttl: item.TTL,
-      data: formatDnsData(item.data, queryType),
-    });
-  }
-
-  return answers;
-}
-
-function isDnsJsonAnswer(value: unknown): value is { name: string; type: number; TTL: number; data: string } {
-  if (!isObject(value)) return false;
-  return (
-    typeof value.name === "string" &&
-    Number.isInteger(value.type) &&
-    Number.isInteger(value.TTL) &&
-    (value.TTL as number) >= 0 &&
-    typeof value.data === "string"
-  );
-}
-
-function formatDnsData(data: string, type: DnsQueryType): string {
-  const value = data.trim();
-  switch (type) {
-    case "TXT":
-      return decodeDnsTxt(value);
-    case "NS":
-    case "CNAME":
-    case "PTR":
-      return formatDomainToken(value);
-    case "MX":
-      return formatTokenizedDomains(value, [1]);
-    case "SOA":
-      return formatTokenizedDomains(value, [0, 1]);
-    case "SRV":
-      return formatTokenizedDomains(value, [3]);
-    case "RRSIG":
-      return formatTokenizedDomains(value, [7]);
-    case "NSEC":
-      return formatTokenizedDomains(value, [0]);
-    case "IPSECKEY":
-      return formatTokenizedDomains(value, [3]);
-    default:
-      return value;
   }
 }
 
-function formatTokenizedDomains(value: string, domainIndexes: number[]): string {
-  const tokens = value.split(/\s+/u);
-  for (const index of domainIndexes) {
-    if (index < tokens.length) tokens[index] = formatDomainToken(tokens[index] ?? "");
+function assertArray(value: unknown): asserts value is unknown[] {
+  if (!Array.isArray(value) || value.length > MAX_DNS_ANSWERS) {
+    throw new DnsQueryError("DNS resolver returned malformed response data.");
   }
-  return tokens.join(" ");
 }
 
-function formatOwnerName(value: string): string {
-  const normalized = value.trim().toLowerCase();
-  return formatDomainToken(normalized);
+function assertStringArray(value: unknown): asserts value is string[] {
+  assertArray(value);
+  if (value.some((item) => typeof item !== "string")) {
+    throw new DnsQueryError("DNS resolver returned malformed response data.");
+  }
 }
 
-function formatDomainToken(value: string): string {
-  return value === "." ? value : value.replace(/\.$/u, "");
+function isStructuredEmailTxt(value: string): boolean {
+  return /^(?:v=(?:spf1|dmarc1|dkim1|bimi1|tlsrptv1|stsv1)\b|(?:k=[^;]+;\s*)?p=)/iu.test(value.trimStart());
 }
 
 function normalizeDnsQueryName(name: string): string {
@@ -412,10 +433,8 @@ function normalizeDnsQueryName(name: string): string {
   return normalized;
 }
 
-function getDnsTypeCode(type: DnsQueryType): number {
-  const typeCode = (DNS_TYPE_CODES as Partial<Record<string, number>>)[type];
-  if (typeCode === undefined) throw new DnsQueryError("Refused an invalid DNS query type.");
-  return typeCode;
+function validateDnsQueryType(type: DnsQueryType): void {
+  if (!(type in DNS_TYPE_CODES)) throw new DnsQueryError("Refused an unsupported DNS query type.");
 }
 
 function normalizeTimeout(timeoutMs: number | undefined): number {
@@ -426,12 +445,48 @@ function normalizeTimeout(timeoutMs: number | undefined): number {
   return Math.floor(timeoutMs);
 }
 
-function isRetryableHttpStatus(status: number): boolean {
-  return status === 408 || status === 425 || status === 429 || status >= 500;
+function isDnsAbsenceError(value: unknown): boolean {
+  const code = dnsErrorCode(value);
+  return code === "ENODATA" || code === "ENOTFOUND" || code === "NXDOMAIN";
 }
 
-function asDnsQueryError(error: unknown): DnsQueryError {
-  return error instanceof DnsQueryError ? error : new RetryableDnsQueryError("DNS resolver could not be reached.");
+function normalizeDnsError(value: unknown): DnsQueryError {
+  if (value instanceof DnsQueryError) return value;
+
+  const code = dnsErrorCode(value);
+  if (code === "ESERVFAIL") return new RetryableDnsQueryError("DNS resolver returned SERVFAIL.");
+  if (code === "EREFUSED") return new DnsQueryError("DNS resolver returned REFUSED.");
+  if (
+    code === "ETIMEOUT" ||
+    code === "ECONNREFUSED" ||
+    code === "EAI_AGAIN" ||
+    code === "EBADQUERY" ||
+    code === "EBADRESP"
+  ) {
+    return new RetryableDnsQueryError("DNS resolver could not be reached.");
+  }
+  return new DnsQueryError("DNS resolver could not complete the query.");
+}
+
+function dnsErrorCode(value: unknown): string | undefined {
+  if (!isObject(value) || typeof value.code !== "string") return undefined;
+  return value.code.toUpperCase();
+}
+
+function isValidTtl(value: unknown): value is number {
+  return isUnsignedInteger(value) && value <= 2 ** 32 - 1;
+}
+
+function isUnsignedInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function escapeQuotedValue(value: string): string {
+  return value.replace(/["\\]/gu, "\\$&");
+}
+
+function stripFinalDot(value: string): string {
+  return value === "." ? value : value.replace(/\.$/u, "");
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

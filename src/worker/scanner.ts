@@ -57,6 +57,11 @@ interface DkimDiscoveryResult {
   failedQueries: number;
 }
 
+interface DnsHealthAnalysis {
+  check: CheckResult;
+  findings: Finding[];
+}
+
 export class ScanUpstreamError extends Error {
   constructor(message: string) {
     super(message);
@@ -69,8 +74,13 @@ export async function scanDomain(domain: string, dns: DnsResolver = new DnsClien
   const scannedAt = new Date().toISOString();
   const dmarcQuery = dns.query(`_dmarc.${domain}`, "TXT");
   const rootTxtQuery = optionalDns(dns.query(domain, "TXT"));
+  const aQuery = optionalDns(dns.query(domain, "A"));
+  const aaaaQuery = optionalDns(dns.query(domain, "AAAA"));
   const mxQuery = optionalDns(dns.query(domain, "MX"));
   const nsQuery = optionalDns(dns.query(domain, "NS"));
+  const cnameQuery = optionalDns(dns.query(domain, "CNAME"));
+  const soaQuery = optionalDns(dns.query(domain, "SOA"));
+  const caaQuery = optionalDns(dns.query(domain, "CAA"));
   const mtaStsQuery = optionalDns(dns.query(`_mta-sts.${domain}`, "TXT"));
   const tlsRptQuery = optionalDns(dns.query(`_smtp._tls.${domain}`, "TXT"));
   const bimiQuery = optionalDns(dns.query(`default._bimi.${domain}`, "TXT"));
@@ -86,17 +96,22 @@ export async function scanDomain(domain: string, dns: DnsResolver = new DnsClien
     throw error;
   }
 
-  const [rootTxt, mx, ns, mtaSts, tlsRpt, bimi, dkimDiscovery] = await Promise.all([
+  const [rootTxt, a, aaaa, mx, ns, cname, soa, caa, mtaSts, tlsRpt, bimi, dkimDiscovery] = await Promise.all([
     rootTxtQuery,
+    aQuery,
+    aaaaQuery,
     mxQuery,
     nsQuery,
+    cnameQuery,
+    soaQuery,
+    caaQuery,
     mtaStsQuery,
     tlsRptQuery,
     bimiQuery,
     dkimQuery,
   ]);
 
-  const dmarc = analyzeDmarc(dmarcAnswers);
+  const dmarc = analyzeDmarc(domain, dmarcAnswers);
 
   let spfEstimate: SpfLookupEstimate | undefined;
   if (!rootTxt.failed) {
@@ -112,9 +127,10 @@ export async function scanDomain(domain: string, dns: DnsResolver = new DnsClien
     }
   }
 
-  const spf = analyzeSpf(rootTxt, spfEstimate);
+  const spf = analyzeSpf(domain, rootTxt, spfEstimate);
   const dkim = analyzeDkim(dkimDiscovery);
-  const transport = analyzeTransport(mx, mtaSts, tlsRpt);
+  const transport = analyzeTransport(domain, mx, mtaSts, tlsRpt);
+  const dnsHealth = analyzeDnsHealth({ rootTxt, a, aaaa, mx, ns, cname, soa, caa });
   const mxProviders = unique(
     mx.answers
       .map((answer) => parseMxHostname(answer.data))
@@ -125,7 +141,13 @@ export async function scanDomain(domain: string, dns: DnsResolver = new DnsClien
   const hasTlsRpt = hasVersionRecord(tlsRpt.answers, "TLSRPTv1");
   const hasBimi = hasVersionRecord(bimi.answers, "BIMI1");
 
-  const findings: Finding[] = [...dmarc.findings, ...spf.findings, ...dkim.findings, ...transport.findings];
+  const findings: Finding[] = [
+    ...dmarc.findings,
+    ...spf.findings,
+    ...dkim.findings,
+    ...transport.findings,
+    ...dnsHealth.findings,
+  ];
   if (hasBimi) {
     findings.push({
       id: "bimi-published",
@@ -136,7 +158,8 @@ export async function scanDomain(domain: string, dns: DnsResolver = new DnsClien
   }
 
   const partialFailures =
-    [rootTxt, mx, ns, mtaSts, tlsRpt, bimi].filter((result) => result.failed).length + dkimDiscovery.failedQueries;
+    [rootTxt, a, aaaa, mx, ns, cname, soa, caa, mtaSts, tlsRpt, bimi].filter((result) => result.failed).length +
+    dkimDiscovery.failedQueries;
   if (partialFailures > 0) {
     findings.push({
       id: "partial-dns-results",
@@ -174,6 +197,7 @@ export async function scanDomain(domain: string, dns: DnsResolver = new DnsClien
       spf: spf.check,
       dkim: dkim.check,
       transport: transport.check,
+      dns: dnsHealth.check,
     },
     dkimSelectors: dkimDiscovery.selectors,
     findings: sortFindings(findings),
@@ -188,7 +212,178 @@ export async function scanDomain(domain: string, dns: DnsResolver = new DnsClien
   };
 }
 
-function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
+function analyzeDnsHealth({
+  rootTxt,
+  a,
+  aaaa,
+  mx,
+  ns,
+  cname,
+  soa,
+  caa,
+}: {
+  rootTxt: OptionalDnsResult;
+  a: OptionalDnsResult;
+  aaaa: OptionalDnsResult;
+  mx: OptionalDnsResult;
+  ns: OptionalDnsResult;
+  cname: OptionalDnsResult;
+  soa: OptionalDnsResult;
+  caa: OptionalDnsResult;
+}): DnsHealthAnalysis {
+  const findings: Finding[] = [];
+  const unavailable = [rootTxt, a, aaaa, mx, ns, cname, soa, caa].filter((result) => result.failed).length;
+  const aliasOwners = new Set(cname.answers.map((answer) => answer.name.toLowerCase().replace(/\.$/u, "")));
+  const hasConflictingAlias = aliasOwners.size > 0 && [...rootTxt.answers, ...mx.answers].some((answer) =>
+    aliasOwners.has(answer.name.toLowerCase().replace(/\.$/u, "")),
+  );
+
+  if (!ns.failed && ns.answers.length === 0) {
+    findings.push({
+      id: "dns-nameservers-not-found",
+      severity: "critical",
+      title: "No authoritative nameservers were returned",
+      detail: "The NS lookup completed without returning a nameserver. A public delegated zone normally requires authoritative NS records.",
+      action: "Confirm registrar delegation and restore the DNS provider's authoritative nameservers.",
+      remediation: {
+        summary: "Restore a valid delegation between the registrar and authoritative DNS provider.",
+        steps: [
+          "Open the registrar's nameserver settings and compare them with the active DNS provider's assigned NS hostnames.",
+          "Replace stale or missing delegation values and confirm the zone exists at the provider.",
+          "Wait for parent-zone TTLs to expire, then verify NS and SOA responses from multiple networks.",
+        ],
+        caution: "Changing delegation can take the entire domain offline. Copy the exact nameservers assigned by the active provider.",
+      },
+    });
+  } else if (!ns.failed && ns.answers.length === 1) {
+    findings.push({
+      id: "dns-single-nameserver",
+      severity: "warning",
+      title: "Only one authoritative nameserver was returned",
+      detail: "A single authoritative server creates an avoidable availability dependency for the domain.",
+      action: "Use at least two authoritative nameservers on resilient infrastructure.",
+      remediation: {
+        summary: "Add the additional authoritative nameservers assigned by the DNS provider.",
+        steps: [
+          "Confirm the provider has provisioned the zone on at least two authoritative servers.",
+          "Add every assigned NS hostname at the registrar; do not invent nameserver addresses.",
+          "Verify all servers return the same current SOA serial and record set.",
+        ],
+      },
+    });
+  }
+
+  if (!soa.failed && soa.answers.length === 0) {
+    findings.push({
+      id: "dns-soa-not-found",
+      severity: "warning",
+      title: "No SOA record was returned",
+      detail: "The SOA lookup completed without the zone authority metadata expected for a delegated DNS zone.",
+      action: "Confirm the zone exists and is authoritative at the delegated DNS provider.",
+      remediation: {
+        summary: "Restore the zone's Start of Authority through the authoritative DNS provider.",
+        steps: [
+          "Confirm the domain is delegated to the intended provider and the DNS zone is active there.",
+          "Check that the provider publishes a valid SOA with a current serial and responsible mailbox.",
+          "Correct delegation or zone provisioning, then compare SOA answers across every authoritative server.",
+        ],
+        caution: "Most managed DNS services create SOA automatically; do not hand-edit it unless the platform explicitly requires that workflow.",
+      },
+    });
+  }
+
+  if (hasConflictingAlias) {
+    findings.push({
+      id: "dns-cname-data-conflict",
+      severity: "critical",
+      title: "CNAME conflicts with other records at the same name",
+      detail: "A CNAME answer was returned while TXT or MX data also exists at the scanned name. Standard DNS does not allow a CNAME to coexist with other record data at one owner name.",
+      action: "Remove the alias or replace it with a provider-supported apex ALIAS/ANAME/flattening record.",
+      remediation: {
+        summary: "Choose one owner-name model: an alias, or independent records—not both.",
+        steps: [
+          "Identify which service added the CNAME and which existing TXT/MX records must remain.",
+          "For an apex domain, use the DNS provider's supported ALIAS, ANAME, or CNAME-flattening feature instead of a literal CNAME.",
+          "Remove the conflicting value, wait for its TTL, and verify CNAME, MX, and TXT again.",
+        ],
+        caution: "Removing MX or verification TXT records can interrupt mail or vendor ownership checks. Preserve required data during the change.",
+      },
+    });
+  }
+
+  const hasCritical = findings.some((finding) => finding.severity === "critical");
+  const hasWarning = findings.some((finding) => finding.severity === "warning");
+  const status: CheckResult["status"] = hasCritical
+    ? "fail"
+    : hasWarning
+      ? "warning"
+      : unavailable > 0
+        ? "unknown"
+        : "pass";
+
+  return {
+    findings,
+    check: {
+      status,
+      title: "DNS record health",
+      summary: unavailable > 0
+        ? `${unavailable} core DNS ${unavailable === 1 ? "lookup was" : "lookups were"} unavailable; completed answers are still shown.`
+        : `Resolved ${a.answers.length} A, ${aaaa.answers.length} AAAA, ${mx.answers.length} MX, ${ns.answers.length} NS, ${rootTxt.answers.length} TXT, ${soa.answers.length} SOA, and ${caa.answers.length} CAA records.`,
+      details: [
+        { label: "IPv4 (A)", value: dnsResultLabel(a) },
+        { label: "IPv6 (AAAA)", value: dnsResultLabel(aaaa) },
+        { label: "Canonical alias (CNAME)", value: dnsResultLabel(cname) },
+        { label: "Mail exchange (MX)", value: dnsResultLabel(mx) },
+        { label: "Nameservers (NS)", value: dnsResultLabel(ns) },
+        { label: "Text (TXT)", value: dnsResultLabel(rootTxt) },
+        { label: "Zone authority (SOA)", value: dnsResultLabel(soa) },
+        { label: "Certificate authorities (CAA)", value: caa.failed ? "Unknown" : caa.answers.length > 0 ? `${caa.answers.length} record(s)` : "Not restricted (optional)" },
+      ],
+      records: toRecordViews([
+        ...a.answers,
+        ...aaaa.answers,
+        ...cname.answers,
+        ...ns.answers,
+        ...rootTxt.answers,
+        ...soa.answers,
+        ...caa.answers,
+      ]),
+    },
+  };
+}
+
+function dnsResultLabel(result: OptionalDnsResult): string {
+  if (result.failed) return "Unknown";
+  return result.answers.length > 0 ? `${result.answers.length} record(s)` : "Not found";
+}
+
+function setDmarcTag(record: string, tag: string, value: string): string {
+  const normalizedTag = tag.toLowerCase();
+  const segments = record
+    .split(";")
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .filter((segment) => segment.slice(0, segment.indexOf("=")).trim().toLowerCase() !== normalizedTag);
+  const nextTag = `${normalizedTag}=${value}`;
+  if (normalizedTag === "p" && /^v\s*=\s*DMARC1$/iu.test(segments[0] ?? "")) {
+    segments.splice(1, 0, nextTag);
+  } else {
+    segments.push(nextTag);
+  }
+  return segments.join("; ");
+}
+
+function removeDmarcTag(record: string, tag: string): string {
+  const normalizedTag = tag.toLowerCase();
+  return record
+    .split(";")
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .filter((segment) => segment.slice(0, segment.indexOf("=")).trim().toLowerCase() !== normalizedTag)
+    .join("; ");
+}
+
+function analyzeDmarc(domain: string, answers: DnsAnswer[]): DmarcAnalysis {
   const records = findDmarcRecords(answers.map((answer) => answer.data));
   const recordViews = toRecordViews(answers.filter((answer) => records.includes(answer.data)));
 
@@ -214,6 +409,20 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
           title: "No direct DMARC record found",
           detail: "The exact _dmarc hostname returned no v=DMARC1 record. For a subdomain, a parent organizational-domain policy may still apply; this scanner does not use a full public-suffix calculation.",
           action: "Confirm whether this is an apex domain, then publish or review DMARC at the applicable organizational domain.",
+          remediation: {
+            summary: "Start with monitoring at the applicable organizational domain.",
+            steps: [
+              "Confirm this is the organizational domain and inventory every service that sends mail using it.",
+              `Create or choose an aggregate-report destination such as dmarc-reports@${domain}.`,
+              "Publish one TXT record at the host shown below, then verify reports before increasing enforcement.",
+            ],
+            record: {
+              name: `_dmarc.${domain}`,
+              type: "TXT",
+              value: `v=DMARC1; p=none; rua=mailto:dmarc-reports@${domain}`,
+            },
+            caution: "Do not use a reporting address until the mailbox or reporting service exists. Subdomains may inherit policy from a parent domain.",
+          },
         },
       ],
     };
@@ -238,6 +447,15 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
           title: "Multiple DMARC records published",
           detail: "DMARC expects one policy record at the applicable _dmarc hostname. Multiple records can cause receivers to ignore the policy.",
           action: "Consolidate the policy and reporting destinations into one DMARC TXT record.",
+          remediation: {
+            summary: "Replace the competing TXT records with one reviewed DMARC policy.",
+            steps: [
+              `Export every TXT value currently published at _dmarc.${domain}.`,
+              "Choose one policy and combine only the reporting destinations you still control.",
+              "Delete the old DMARC values, publish the single replacement, and rescan after the TTL expires.",
+            ],
+            caution: "Do not concatenate complete DMARC records; the result would still contain duplicate v and p tags.",
+          },
         },
       ],
     };
@@ -263,6 +481,15 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
           title: "DMARC record has syntax problems",
           detail: parsed.errors.join(" "),
           action: "Correct the record and confirm that only one v=DMARC1 TXT record is published.",
+          remediation: {
+            summary: "Repair the existing policy in place so receivers see one valid record.",
+            steps: [
+              "Keep v=DMARC1 as the first tag and publish exactly one p tag.",
+              "Correct the syntax issues listed above without creating a second TXT policy.",
+              "Rescan the domain and inspect aggregate reports before changing enforcement.",
+            ],
+            caution: "An automatic rewrite is unsafe when the intended reporting addresses and policy are unknown.",
+          },
         },
       ],
     };
@@ -291,7 +518,31 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
             ? `The record declares p=${policy}, while t=y requests testing behavior one policy level lower (${effectivePolicy}). Receiver behavior can still vary.`
             : `The record requests ${policy} treatment for DMARC-failing messages. Receiver behavior can still vary.`,
       ...(policy === "none"
-        ? { action: "Use aggregate reports to inventory and remediate legitimate senders before moving gradually toward enforcement." }
+        ? {
+            action: "Use aggregate reports to inventory and remediate legitimate senders before moving gradually toward enforcement.",
+            remediation: {
+              summary: "Move from monitoring to enforcement only after legitimate mail is aligned.",
+              steps: [
+                "Collect aggregate reports long enough to cover normal and infrequent sending services.",
+                "For each legitimate source, align either DKIM d= or the SPF-authenticated return-path with the visible From domain.",
+                "Run controlled mail-flow tests, then change p to quarantine; monitor again before moving to reject.",
+              ],
+              caution: "A DNS scan cannot see every sender. Raising policy without report evidence can quarantine legitimate mail.",
+            },
+          }
+        : parsed.testing
+          ? {
+              action: "Validate the expected lower enforcement level, then remove t=y when the declared policy is ready to apply normally.",
+              remediation: {
+                summary: "Finish the test-mode validation before applying the declared policy normally.",
+                steps: [
+                  "Confirm aggregate reports show all legitimate senders aligned at the declared policy scope.",
+                  "Test business-critical and low-frequency mail flows, including forwarding and third-party services.",
+                  "Remove t=y from the existing DMARC record and monitor receiver behavior after propagation.",
+                ],
+                caution: "Receiver support for t=y can vary; use observed mail and aggregate evidence rather than assuming uniform behavior.",
+              },
+            }
         : {}),
     },
     ...weakerScopedPolicyFindings(scope, parsed.testing),
@@ -304,6 +555,20 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
       title: "Aggregate reporting is not configured",
       detail: "No rua destination is present, limiting visibility into observed authentication and alignment results.",
       action: "Add an authorized aggregate-report mailbox or DMARC analysis service.",
+      remediation: {
+        summary: "Add aggregate reporting to the existing valid policy.",
+        steps: [
+          `Create dmarc-reports@${domain} or select a reporting provider and complete any external-destination authorization it requires.`,
+          "Add one rua tag to the existing DMARC TXT record.",
+          "Verify XML reports are arriving before relying on the data for enforcement changes.",
+        ],
+        record: {
+          name: `_dmarc.${domain}`,
+          type: "TXT",
+          value: setDmarcTag(records[0] ?? "v=DMARC1; p=none", "rua", `mailto:dmarc-reports@${domain}`),
+        },
+        caution: "Use the reporting address or service you actually operate; the example mailbox is not created automatically.",
+      },
     });
   }
   if (parsed.tags.pct !== undefined) {
@@ -313,6 +578,19 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
       title: `Historic pct=${parsed.tags.pct} tag is published`,
       detail: "RFC 9989 removed pct because percentage sampling was not applied consistently. Current DMARC processing ignores this tag.",
       action: "Use RFC 9989 t=y when test-mode signaling is appropriate, and use aggregate evidence plus controlled rollout procedures before changing policy.",
+      remediation: {
+        summary: "Remove the obsolete pct tag without changing the active policy.",
+        steps: [
+          "Edit the existing TXT value rather than publishing a second record.",
+          "Remove only the pct tag and leave the reviewed policy and report destinations intact.",
+          "Rescan after DNS propagation and confirm that receivers still send aggregate reports.",
+        ],
+        record: {
+          name: `_dmarc.${domain}`,
+          type: "TXT",
+          value: removeDmarcTag(records[0] ?? "", "pct"),
+        },
+      },
     });
   }
 
@@ -323,6 +601,19 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
       title: "No explicit p tag is published",
       detail: "RFC 9989 can use p=none as a default for an otherwise applicable record. Explicit policy is clearer, and records without a valid p or rua may result in no DMARC processing during discovery.",
       action: "Publish an explicit reviewed p value appropriate for the domain's current configuration stage.",
+      remediation: {
+        summary: "Make the current monitoring policy explicit.",
+        steps: [
+          "Confirm p=none matches the intended rollout stage.",
+          "Add p=none immediately after v=DMARC1 in the existing record.",
+          "Use aggregate evidence to plan a later move to quarantine and reject.",
+        ],
+        record: {
+          name: `_dmarc.${domain}`,
+          type: "TXT",
+          value: setDmarcTag(records[0] ?? "v=DMARC1", "p", "none"),
+        },
+      },
     });
   }
 
@@ -380,7 +671,7 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
   };
 }
 
-function analyzeSpf(rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | undefined): SpfAnalysis {
+function analyzeSpf(domain: string, rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | undefined): SpfAnalysis {
   if (rootTxt.failed) {
     return {
       points: 0,
@@ -414,6 +705,20 @@ function analyzeSpf(rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | un
           title: "No SPF record found",
           detail: "The scanned hostname does not directly publish a v=spf1 TXT record. Whether SPF is needed depends on how the domain is used in envelope-from identities.",
           action: "Inventory outbound services before publishing SPF; do not guess include mechanisms.",
+          remediation: {
+            summary: "Publish one SPF policy only after identifying every envelope-from sender.",
+            steps: [
+              "List the mailbox provider, marketing platforms, ticketing systems, and other services that send with this domain in the return-path.",
+              "Use each provider's documented include mechanism or approved IP ranges and combine them into one TXT record at the root.",
+              "End with ~all during validation, then consider -all after mail-flow evidence confirms the inventory.",
+            ],
+            record: {
+              name: domain,
+              type: "TXT",
+              value: "v=spf1 -all",
+            },
+            caution: "The copy-ready value is only correct when this domain must never send mail. Do not deploy it on an active sending domain.",
+          },
         },
       ],
     };
@@ -436,6 +741,15 @@ function analyzeSpf(rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | un
           title: "Multiple SPF records published",
           detail: "A hostname must not publish more than one SPF policy record.",
           action: "Merge authorized mechanisms into one reviewed SPF record.",
+          remediation: {
+            summary: "Consolidate all authorized senders into one SPF TXT value.",
+            steps: [
+              "Inventory the mechanisms from every current SPF record and remove services that are no longer used.",
+              "Build one v=spf1 record with each required mechanism once and a single terminal all mechanism.",
+              "Replace the old SPF TXT values with the one reviewed record and verify the recursive lookup count is 10 or fewer.",
+            ],
+            caution: "Do not simply concatenate whole records; duplicate v=spf1 and all terms create invalid or unreachable policy.",
+          },
         },
       ],
     };
@@ -459,6 +773,15 @@ function analyzeSpf(rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | un
           title: "SPF record has syntax problems",
           detail: parsed.errors.join(" "),
           action: "Correct and test the SPF record before relying on it for DMARC alignment.",
+          remediation: {
+            summary: "Repair the existing SPF TXT record without adding a second policy.",
+            steps: [
+              "Correct each syntax issue listed above in the existing root TXT value.",
+              "Keep one v=spf1 prefix, validate every IP/CIDR and include target, and leave one terminal all mechanism.",
+              "Rescan and send controlled test messages through every legitimate provider.",
+            ],
+            caution: "The scanner cannot safely invent a replacement because it does not know the domain's full sender inventory.",
+          },
         },
       ],
     };
@@ -480,6 +803,15 @@ function analyzeSpf(rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | un
       title: "SPF authorizes every sender",
       detail: "+all matches every source as an SPF pass and removes useful sender restriction.",
       action: "Replace +all only after identifying the systems that legitimately use this envelope-from domain.",
+      remediation: {
+        summary: "Replace universal authorization with an inventoried sender policy.",
+        steps: [
+          "Inventory every legitimate envelope-from sender and add only its approved include or IP mechanism.",
+          "Use ~all while validating the inventory, then move to -all when legitimate mail is consistently passing.",
+          "Confirm the complete policy stays within the ten-lookup SPF limit.",
+        ],
+        caution: "Changing +all before sender discovery can block legitimate mail; leaving it in place allows any source to pass SPF.",
+      },
     });
   } else {
     findings.push({
@@ -497,6 +829,15 @@ function analyzeSpf(rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | un
       title: "SPF lookup estimate exceeds 10",
       detail: `Static recursive expansion found ${estimate.count} lookup-causing terms. Runtime macro expansion and short-circuit evaluation can change the path, but exceeding 10 can produce permerror.`,
       action: "Review nested include and redirect chains; remove obsolete services instead of flattening blindly.",
+      remediation: {
+        summary: "Reduce the worst-case SPF evaluation path to ten DNS lookups or fewer.",
+        steps: [
+          "Remove unused provider includes and duplicate mechanisms first.",
+          "Move senders that can use a dedicated return-path onto an authenticated subdomain with its own SPF policy.",
+          "Ask active providers for a lower-lookup include; avoid static flattening unless changes are monitored continuously.",
+        ],
+        caution: "Provider IP ranges change. A one-time flattened record can silently become stale and break delivery.",
+      },
     });
   }
   if (estimate?.truncated || estimate?.issues.length) {
@@ -554,6 +895,15 @@ function analyzeDkim(discovery: DkimDiscoveryResult): { check: CheckResult; poin
           title: "No common DKIM selector discovered",
           detail: `The scanner tested a short list of common selectors only${failedQueries > 0 ? `, with ${failedQueries} DNS queries unavailable` : ""}. A domain may use any selector, and a published key does not prove that current messages are correctly signed or aligned.`,
           action: "Inspect DKIM-Signature headers and DMARC aggregate data to identify selectors actually in use.",
+          remediation: {
+            summary: "Find the real selector before adding or changing DKIM DNS.",
+            steps: [
+              "Send a test through each legitimate platform and inspect the DKIM-Signature header for s= (selector) and d= (signing domain).",
+              "Query selector._domainkey.signing-domain and compare the result with the platform's current setup instructions.",
+              "Enable signing or repair the provider-supplied TXT/CNAME, then verify that d= aligns with the visible From domain.",
+            ],
+            caution: "Selectors are not enumerable. Do not assume DKIM is missing merely because common names were not found.",
+          },
         },
       ],
     };
@@ -588,11 +938,14 @@ function analyzeDkim(discovery: DkimDiscoveryResult): { check: CheckResult; poin
 }
 
 function analyzeTransport(
+  domain: string,
   mx: OptionalDnsResult,
   mtaSts: OptionalDnsResult,
   tlsRpt: OptionalDnsResult,
 ): { check: CheckResult; points: number; findings: Finding[] } {
   const hasMx = mx.answers.length > 0;
+  const hasNullMx = mx.answers.some((answer) => /^\s*0\s+\.\s*$/u.test(answer.data));
+  const receivesMail = hasMx && !hasNullMx;
   const hasMtaSts = hasVersionRecord(mtaSts.answers, "STSv1");
   const hasTlsRpt = hasVersionRecord(tlsRpt.answers, "TLSRPTv1");
   const points = (hasMtaSts ? 8 : 0) + (hasTlsRpt ? 5 : 0);
@@ -604,6 +957,21 @@ function analyzeTransport(
       severity: "info",
       title: "No MX record found",
       detail: "The domain may not receive email. This is informational and is not treated as an authentication failure.",
+      action: "Confirm whether the domain should receive mail and publish either provider MX records or an explicit null MX.",
+      remediation: {
+        summary: "Make the domain's inbound-mail intent explicit.",
+        steps: [
+          "If the domain receives mail, copy the exact MX priorities and hostnames supplied by the mailbox provider.",
+          "If it must never receive mail, publish the null MX value shown below.",
+          "Remove obsolete MX values and rescan after the DNS TTL expires.",
+        ],
+        record: {
+          name: domain,
+          type: "MX",
+          value: "0 .",
+        },
+        caution: "A null MX deliberately prevents inbound delivery. Do not publish it on a domain that should receive email.",
+      },
     });
   }
   if (hasMtaSts) {
@@ -623,6 +991,54 @@ function analyzeTransport(
     });
   }
 
+  if (receivesMail && !mtaSts.failed && !hasMtaSts) {
+    findings.push({
+      id: "mta-sts-not-found",
+      severity: "info",
+      title: "MTA-STS is not published",
+      detail: "The domain accepts mail but no v=STSv1 DNS marker was found. MTA-STS is optional hardening against transport downgrade and MX impersonation.",
+      action: "Host and test an MTA-STS HTTPS policy before publishing its DNS marker.",
+      remediation: {
+        summary: "Deploy the HTTPS policy first, then publish a versioned DNS marker.",
+        steps: [
+          `Serve a valid policy at https://mta-sts.${domain}/.well-known/mta-sts.txt using mode: testing and the real MX patterns.`,
+          "Confirm the certificate, content type, policy syntax, and every MX pattern.",
+          "Publish the TXT marker below, monitor TLS reports, then move the HTTPS policy to mode: enforce when ready.",
+        ],
+        record: {
+          name: `_mta-sts.${domain}`,
+          type: "TXT",
+          value: `v=STSv1; id=${new Date().toISOString().slice(0, 10).replaceAll("-", "")}`,
+        },
+        caution: "The DNS marker alone does not enable MTA-STS. A valid HTTPS policy and accurate MX patterns are required.",
+      },
+    });
+  }
+
+  if (receivesMail && !tlsRpt.failed && !hasTlsRpt) {
+    findings.push({
+      id: "tls-rpt-not-found",
+      severity: "info",
+      title: "SMTP TLS reporting is not published",
+      detail: "No v=TLSRPTv1 record was found. TLS-RPT is optional, but it provides visibility into transport failures and downgrade attempts.",
+      action: "Create a report destination, then publish one TLS-RPT TXT record.",
+      remediation: {
+        summary: "Create a TLS report mailbox or service and publish its destination.",
+        steps: [
+          `Create tls-reports@${domain} or choose a TLS reporting service.`,
+          "Publish the TXT value below at the exact _smtp._tls host.",
+          "Verify JSON reports arrive and investigate sustained policy or certificate failures.",
+        ],
+        record: {
+          name: `_smtp._tls.${domain}`,
+          type: "TXT",
+          value: `v=TLSRPTv1; rua=mailto:tls-reports@${domain}`,
+        },
+        caution: "The destination must exist and accept reports; external services can require additional authorization.",
+      },
+    });
+  }
+
   const unavailable = mx.failed || mtaSts.failed || tlsRpt.failed;
   return {
     points,
@@ -631,9 +1047,9 @@ function analyzeTransport(
       title: "Mail transport",
       summary: unavailable
         ? "One or more transport DNS queries were unavailable."
-        : `MX ${hasMx ? "found" : "not found"}; MTA-STS marker ${hasMtaSts ? "found" : "not found"}; TLS-RPT ${hasTlsRpt ? "found" : "not found"}.`,
+        : `MX ${hasNullMx ? "explicitly disabled (null MX)" : hasMx ? "found" : "not found"}; MTA-STS marker ${hasMtaSts ? "found" : "not found"}; TLS-RPT ${hasTlsRpt ? "found" : "not found"}.`,
       details: [
-        { label: "MX", value: hasMx ? `${mx.answers.length} record(s)` : mx.failed ? "Unknown" : "Not found" },
+        { label: "MX", value: hasNullMx ? "Null MX (inbound mail disabled)" : hasMx ? `${mx.answers.length} record(s)` : mx.failed ? "Unknown" : "Not found" },
         { label: "MTA-STS", value: hasMtaSts ? "DNS marker found; HTTPS policy not tested" : mtaSts.failed ? "Unknown" : "Not found" },
         { label: "TLS-RPT", value: hasTlsRpt ? "Record found" : tlsRpt.failed ? "Unknown" : "Not found" },
       ],
@@ -733,6 +1149,15 @@ function weakerScopedPolicyFindings(scope: DmarcScopeAnalysis, testing: boolean)
       title: "Existing subdomains have a weaker DMARC policy",
       detail: `The record declares p=${scope.organizationalPolicy}, but explicit sp=${scope.subdomainPolicy} requests weaker handling for existing subdomains.${inheritedNonexistentPolicy}${testing ? ` With t=y, their expected handling is ${scope.effectiveSubdomainPolicy}.` : ""}`,
       action: "Confirm that the weaker subdomain policy is intentional and review aggregate evidence before strengthening it.",
+      remediation: {
+        summary: "Remove or strengthen sp only after subdomain senders are verified.",
+        steps: [
+          "Use aggregate reports to identify every legitimate From-domain below the organizational domain.",
+          "Fix SPF or DKIM alignment for those sources and confirm parked subdomains do not send mail.",
+          `When ready, set sp=${scope.organizationalPolicy} or remove sp so it inherits p=${scope.organizationalPolicy}.`,
+        ],
+        caution: "An inherited stronger policy can affect every existing subdomain, including rarely used business systems.",
+      },
     });
   }
 
@@ -751,6 +1176,15 @@ function weakerScopedPolicyFindings(scope: DmarcScopeAnalysis, testing: boolean)
       title: "Nonexistent subdomains have a weaker DMARC policy",
       detail: `Explicit np=${scope.nonexistentSubdomainPolicy} requests weaker handling for nonexistent subdomains than ${broaderPolicies.join(" and ")}.${testing ? ` With t=y, their expected handling is ${scope.effectiveNonexistentSubdomainPolicy}.` : ""}`,
       action: "Confirm that the weaker nonexistent-subdomain policy is intentional; random subdomain spoofing can otherwise receive less restrictive treatment.",
+      remediation: {
+        summary: "Align the nonexistent-subdomain policy with the intended broader policy.",
+        steps: [
+          "Confirm no provisioning workflow depends on mail from names that do not yet exist in DNS.",
+          "Review aggregate evidence for random-subdomain abuse and legitimate subdomain senders.",
+          `When ready, set np=${scope.organizationalPolicy} or remove np to inherit the broader policy.`,
+        ],
+        caution: "The np tag is defined by current DMARC but receiver deployment may vary; keep the broader p/sp policy sound as well.",
+      },
     });
   }
 

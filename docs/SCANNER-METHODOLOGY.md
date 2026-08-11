@@ -40,6 +40,16 @@ The scanner checks:
 
 These controls are reported separately from DMARC policy. Missing optional controls do not invalidate DMARC.
 
+## Core DNS and advanced lookup
+
+The main scan also resolves A, AAAA, CNAME, TXT, MX, NS, SOA, and CAA. It flags evidence-backed delegation and owner-name conflicts without treating optional records or an email-only domain as broken. Advanced lookup exposes additional DNS and DNSSEC resource-record types one at a time. An empty advanced answer is not scored and is not automatically labeled an issue.
+
+DNS JSON response codes are interpreted explicitly: NOERROR without the requested type and NXDOMAIN are empty results; SERVFAIL, REFUSED, transport errors, malformed responses, and timeouts remain indeterminate failures. TXT character-string chunks are joined only within one resource record, never across separate TXT records.
+
+## Remediation guidance
+
+Warnings and failures include ordered repair steps. When the intended value can be expressed safely, the result includes a copy-ready host, type, and value. Templates are conditional: for example, `v=spf1 -all` is only appropriate for a domain that must not send, and `0 .` is only appropriate for a domain that must not receive. The user must confirm sender inventory, mailbox/report destinations, provider-specific host formatting, and change-control requirements before publishing.
+
 ## Configuration score
 
 The score summarizes published configuration. It is not a security rating and is not enforcement approval. DMARC policy points use the weakest effective policy across `p`, inherited or explicit `sp`, and inherited or explicit `np`, so a strong organizational-domain policy cannot hide a weaker scoped exception. Policy stage always takes precedence over the number shown.
@@ -54,3 +64,5 @@ Aggregate-report history, sender ownership, business confirmation, and change mo
 - Common-selector discovery cannot prove DKIM absence.
 - A snapshot cannot detect intermittent sending systems.
 - A DMARC pass authenticates domain use but does not prove message safety.
+- The scanner uses one public recursive resolver and is not a multi-vantage DNS-propagation test.
+- It does not provide SMTP probing, blacklist reputation, port scanning, ping, traceroute, inbox placement, or continuous mailflow monitoring.

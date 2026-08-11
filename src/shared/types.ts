@@ -15,6 +15,16 @@ export interface Finding {
   title: string;
   detail: string;
   action?: string;
+  remediation?: {
+    summary: string;
+    steps: string[];
+    record?: {
+      name: string;
+      type: string;
+      value: string;
+    };
+    caution?: string;
+  };
 }
 
 export interface CheckResult {
@@ -47,6 +57,7 @@ export interface ScanResult {
     spf: CheckResult;
     dkim: CheckResult;
     transport: CheckResult;
+    dns: CheckResult;
   };
   dkimSelectors: DkimSelectorResult[];
   findings: Finding[];
@@ -63,4 +74,35 @@ export interface ScanResult {
 export interface ScanError {
   error: string;
   code: "INVALID_DOMAIN" | "METHOD_NOT_ALLOWED" | "BAD_REQUEST" | "UPSTREAM_ERROR" | "NOT_FOUND";
+}
+
+export type DnsLookupType =
+  | "A"
+  | "AAAA"
+  | "CAA"
+  | "CERT"
+  | "CNAME"
+  | "DNSKEY"
+  | "DS"
+  | "IPSECKEY"
+  | "LOC"
+  | "MX"
+  | "NS"
+  | "NSEC"
+  | "NSEC3PARAM"
+  | "PTR"
+  | "RRSIG"
+  | "SOA"
+  | "SRV"
+  | "TLSA"
+  | "TXT";
+
+export interface DnsLookupResult {
+  input: string;
+  queryName: string;
+  type: DnsLookupType;
+  scannedAt: string;
+  durationMs: number;
+  records: DnsRecordView[];
+  summary: string;
 }

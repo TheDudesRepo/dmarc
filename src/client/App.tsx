@@ -38,6 +38,8 @@ import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import type {
   CheckResult,
   CheckStatus,
+  DnsLookupResult,
+  DnsLookupType,
   Finding,
   FindingSeverity,
   ScanError,
@@ -45,6 +47,43 @@ import type {
 } from "../shared/types";
 
 const EXAMPLE_DOMAINS = ["google.com", "github.com", "cloudflare.com"];
+
+const COMMON_DNS_LOOKUP_TYPES: DnsLookupType[] = [
+  "A",
+  "AAAA",
+  "MX",
+  "NS",
+  "TXT",
+  "CNAME",
+  "SOA",
+  "CAA",
+  "SRV",
+  "PTR",
+];
+
+const ADVANCED_DNS_LOOKUP_TYPES: DnsLookupType[] = [
+  "DNSKEY",
+  "DS",
+  "RRSIG",
+  "NSEC",
+  "NSEC3PARAM",
+  "CERT",
+  "LOC",
+  "IPSECKEY",
+  "TLSA",
+];
+
+const DNS_LOOKUP_HINTS: Partial<Record<DnsLookupType, string>> = {
+  TXT: "Use the exact owner name, such as selector._domainkey.example.com for a DKIM key.",
+  CNAME: "Use the alias owner name, such as www.example.com.",
+  SRV: "Service records use _service._protocol, such as _sip._tcp.example.com.",
+  PTR: "Enter an IPv4 or IPv6 address; the server converts it to the reverse-DNS owner name.",
+  TLSA: "TLSA owners include port and protocol, such as _25._tcp.mx.example.com.",
+  DNSKEY: "Use the zone name whose published DNSSEC keys you want to inspect.",
+  DS: "Use the delegated child-zone name whose parent-published DS record you want to inspect.",
+  RRSIG: "Use the exact owner name whose DNSSEC signatures you want to inspect.",
+  NSEC: "Use an owner name in a DNSSEC-signed zone; an empty answer is not automatically an error.",
+};
 
 function isScanResult(value: unknown): value is ScanResult {
   if (!value || typeof value !== "object") return false;
@@ -56,7 +95,13 @@ function isScanResult(value: unknown): value is ScanResult {
     typeof candidate.score === "number" &&
     typeof candidate.grade === "string" &&
     typeof candidate.posture === "string" &&
-    Boolean(candidate.checks?.dmarc && candidate.checks?.spf && candidate.checks?.dkim && candidate.checks?.transport) &&
+    Boolean(
+      candidate.checks?.dmarc &&
+      candidate.checks?.spf &&
+      candidate.checks?.dkim &&
+      candidate.checks?.transport &&
+      candidate.checks?.dns,
+    ) &&
     Array.isArray(candidate.findings) &&
     Boolean(candidate.metadata)
   );
@@ -66,6 +111,38 @@ function isScanError(value: unknown): value is ScanError {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<ScanError>;
   return typeof candidate.error === "string" && typeof candidate.code === "string";
+}
+
+function isDnsLookupResult(value: unknown): value is DnsLookupResult {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<DnsLookupResult>;
+  return (
+    typeof candidate.input === "string" &&
+    typeof candidate.queryName === "string" &&
+    typeof candidate.type === "string" &&
+    typeof candidate.scannedAt === "string" &&
+    typeof candidate.durationMs === "number" &&
+    typeof candidate.summary === "string" &&
+    Array.isArray(candidate.records)
+  );
+}
+
+function dnsLookupExample(type: DnsLookupType, suggestedDomain: string): string {
+  const domain = suggestedDomain || "example.com";
+  if (type === "PTR") return "192.0.2.25";
+  if (type === "TXT") return `selector._domainkey.${domain}`;
+  if (type === "CNAME") return `www.${domain}`;
+  if (type === "SRV") return `_sip._tcp.${domain}`;
+  if (type === "TLSA") return `_25._tcp.mx.${domain}`;
+  return domain;
+}
+
+function suggestedDnsLookupInput(type: DnsLookupType, suggestedDomain: string): string {
+  if (!suggestedDomain || type === "PTR") return "";
+  if (type === "CNAME" || type === "SRV" || type === "TLSA") {
+    return dnsLookupExample(type, suggestedDomain);
+  }
+  return suggestedDomain;
 }
 
 const statusIcons: Record<CheckStatus, ReactNode> = {
@@ -104,6 +181,7 @@ function Header() {
       <div className="container header-inner">
         <Brand />
         <nav className="desktop-nav" aria-label="Primary navigation">
+          <a href="#dns-explorer">DNS tools</a>
           <a href="#how-it-works">How it works</a>
           <a href="#methodology">Methodology</a>
           <a href="#roadmap">Roadmap</a>
@@ -185,8 +263,8 @@ function Hero({
         <div className="eyebrow"><span /> Free email authentication check</div>
         <h1>Know what stands between your domain and <em>enforcement.</em></h1>
         <p className="hero-copy">
-          Inspect DMARC, SPF, discoverable DKIM, and mail transport controls in seconds. Get a
-          clear explanation of what is configured, what is exposed, and what to fix next.
+          Inspect DMARC, SPF, discoverable DKIM, DNS health, and mail transport controls in seconds.
+          Get a clear explanation of what is configured, what is exposed, and what to fix next.
         </p>
         <div className="hero-scanner">
           <ScanForm
@@ -221,6 +299,7 @@ function Hero({
         <span><Network aria-hidden="true" /> SPF policy</span>
         <span><KeyRound aria-hidden="true" /> DKIM discovery</span>
         <span><MailCheck aria-hidden="true" /> Transport security</span>
+        <span><Globe2 aria-hidden="true" /> DNS health</span>
       </div>
     </section>
   );
@@ -298,13 +377,15 @@ function CheckCard({
   icon,
   label,
   check,
+  wide = false,
 }: {
   icon: ReactNode;
   label: string;
   check: CheckResult;
+  wide?: boolean;
 }) {
   return (
-    <article className={`check-card status-${check.status}`}>
+    <article className={`check-card status-${check.status} ${wide ? "check-card-wide" : ""}`}>
       <div className="check-card-header">
         <span className="check-icon">{icon}</span>
         <span className={`status-badge status-${check.status}`}>
@@ -312,24 +393,54 @@ function CheckCard({
           {check.status === "pass" ? "Configured" : check.status}
         </span>
       </div>
-      <p className="check-label">{label}</p>
-      <h3>{check.title}</h3>
-      <p className="check-summary">{check.summary}</p>
-      {check.details.length > 0 && (
-        <dl className="check-details">
-          {check.details.map((detail) => (
-            <div key={`${detail.label}-${detail.value}`}>
-              <dt>{detail.label}</dt>
-              <dd>{detail.value}</dd>
-            </div>
-          ))}
-        </dl>
-      )}
+      <div className="check-card-content">
+        <div className="check-card-copy">
+          <p className="check-label">{label}</p>
+          <h3>{check.title}</h3>
+          <p className="check-summary">{check.summary}</p>
+        </div>
+        {check.details.length > 0 && (
+          <dl className="check-details">
+            {check.details.map((detail) => (
+              <div key={`${detail.label}-${detail.value}`}>
+                <dt>{detail.label}</dt>
+                <dd>{detail.value}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+      </div>
     </article>
   );
 }
 
 function FindingRow({ finding, index }: { finding: Finding; index: number }) {
+  const [copiedField, setCopiedField] = useState<"name" | "type" | "value" | null>(null);
+  const [copyFailed, setCopyFailed] = useState(false);
+
+  async function copyRemediationField(field: "name" | "type" | "value", value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedField(field);
+      setCopyFailed(false);
+      window.setTimeout(() => setCopiedField((current) => current === field ? null : current), 1800);
+    } catch {
+      setCopiedField(null);
+      setCopyFailed(true);
+      window.setTimeout(() => setCopyFailed(false), 2400);
+    }
+  }
+
+  const remediationRecord = finding.remediation?.record;
+  const remediationFields = remediationRecord
+    ? [
+        { key: "name" as const, label: "Host / name", value: remediationRecord.name },
+        { key: "type" as const, label: "Record type", value: remediationRecord.type },
+        { key: "value" as const, label: "Value", value: remediationRecord.value },
+      ]
+    : [];
+  const copiedFieldLabel = remediationFields.find((field) => field.key === copiedField)?.label;
+
   return (
     <li className={`finding finding-${finding.severity}`}>
       <span className="finding-index">{String(index + 1).padStart(2, "0")}</span>
@@ -343,6 +454,70 @@ function FindingRow({ finding, index }: { finding: Finding; index: number }) {
         {finding.action && (
           <div className="finding-action"><ChevronRight aria-hidden="true" /> {finding.action}</div>
         )}
+        {finding.remediation && (
+          <details className="remediation-panel">
+            <summary>
+              <span><ShieldCheck aria-hidden="true" /> How to fix</span>
+              <ChevronRight className="remediation-chevron" aria-hidden="true" />
+            </summary>
+            <div className="remediation-content">
+              <p className="remediation-summary">{finding.remediation.summary}</p>
+              {finding.remediation.steps.length > 0 && (
+                <ol className="remediation-steps" role="list">
+                  {finding.remediation.steps.map((step, stepIndex) => (
+                    <li key={`${finding.id}-step-${stepIndex}`}>{step}</li>
+                  ))}
+                </ol>
+              )}
+              {remediationRecord && (
+                <div className="fix-record" role="group" aria-label="Copy-ready DNS record">
+                  <div className="fix-record-heading">
+                    <div>
+                      <strong>Copy-ready DNS record</strong>
+                      <span>Use these fields in your DNS provider.</span>
+                    </div>
+                    <Code2 aria-hidden="true" />
+                  </div>
+                  <dl>
+                    {remediationFields.map((field) => (
+                      <div className="fix-record-row" key={field.key}>
+                        <dt>{field.label}</dt>
+                        <dd>
+                          <code>{field.value}</code>
+                          <button
+                            type="button"
+                            className="copy-field-button"
+                            onClick={() => void copyRemediationField(field.key, field.value)}
+                            aria-label={`Copy ${field.label.toLowerCase()}`}
+                          >
+                            {copiedField === field.key ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+                            <span>{copiedField === field.key ? "Copied" : "Copy"}</span>
+                          </button>
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+                  <p className="fix-record-provider-note">
+                    <Info aria-hidden="true" />
+                    Some DNS dashboards expect a relative host such as <code>_dmarc</code> instead of the full name. Verify your provider’s behavior so it does not append the domain twice.
+                  </p>
+                  <span className="sr-only" aria-live="polite">
+                    {copiedFieldLabel ? `${copiedFieldLabel} copied.` : ""}
+                  </span>
+                  {copyFailed && (
+                    <p className="copy-error" role="alert">Copy failed. Select and copy the value manually.</p>
+                  )}
+                </div>
+              )}
+              {finding.remediation.caution && (
+                <div className="remediation-caution" role="note">
+                  <AlertTriangle aria-hidden="true" />
+                  <div><strong>Before you publish</strong><span>{finding.remediation.caution}</span></div>
+                </div>
+              )}
+            </div>
+          </details>
+        )}
       </div>
     </li>
   );
@@ -351,7 +526,14 @@ function FindingRow({ finding, index }: { finding: Finding; index: number }) {
 function RecordsPanel({ result }: { result: ScanResult }) {
   const [copied, setCopied] = useState<string | null>(null);
   const checks = Object.values(result.checks);
-  const records = checks.flatMap((check) => check.records);
+  const records = Array.from(
+    new Map(
+      checks.flatMap((check) => check.records).map((record) => [
+        JSON.stringify([record.name.toLowerCase(), record.type.toUpperCase(), record.value]),
+        record,
+      ] as const),
+    ).values(),
+  );
 
   async function copyRecord(value: string, key: string) {
     await navigator.clipboard.writeText(value);
@@ -474,14 +656,15 @@ function Results({
         </div>
 
         <div className="section-heading section-heading-row">
-          <div><span className="section-number">01</span><div><p>Control coverage</p><h2>Authentication at a glance</h2></div></div>
-          <span className="section-caption">Four independent control groups</span>
+          <div><span className="section-number">01</span><div><p>Control coverage</p><h2>Email and DNS at a glance</h2></div></div>
+          <span className="section-caption">Five independent control groups</span>
         </div>
         <div className="checks-grid">
           <CheckCard icon={<ShieldCheck />} label="DMARC" check={result.checks.dmarc} />
           <CheckCard icon={<Network />} label="SPF" check={result.checks.spf} />
           <CheckCard icon={<KeyRound />} label="DKIM visibility" check={result.checks.dkim} />
           <CheckCard icon={<MailCheck />} label="Mail transport" check={result.checks.transport} />
+          <CheckCard wide icon={<Globe2 />} label="DNS health" check={result.checks.dns} />
         </div>
 
         <div className="analysis-grid">
@@ -520,6 +703,292 @@ function Results({
           }}>
             <RefreshCw aria-hidden="true" /> Scan another domain
           </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
+  const [lookupType, setLookupType] = useState<DnsLookupType>("A");
+  const [lookupInput, setLookupInput] = useState("");
+  const [hasEditedInput, setHasEditedInput] = useState(false);
+  const [lookupResult, setLookupResult] = useState<DnsLookupResult | null>(null);
+  const [lookupError, setLookupError] = useState<string | null>(null);
+  const [lookupLoading, setLookupLoading] = useState(false);
+  const [copiedRecord, setCopiedRecord] = useState<string | null>(null);
+  const [copyMessage, setCopyMessage] = useState("");
+  const lookupControllerRef = useRef<AbortController | null>(null);
+
+  const cleanSuggestedDomain = suggestedDomain.trim();
+  const example = dnsLookupExample(lookupType, cleanSuggestedDomain);
+  const hint = DNS_LOOKUP_HINTS[lookupType] ?? "Enter the exact public DNS owner name you want to query.";
+
+  useEffect(() => {
+    if (!hasEditedInput && cleanSuggestedDomain) {
+      setLookupInput(suggestedDnsLookupInput(lookupType, cleanSuggestedDomain));
+    }
+  }, [cleanSuggestedDomain, hasEditedInput, lookupType]);
+
+  useEffect(() => () => lookupControllerRef.current?.abort(), []);
+
+  function handleLookupTypeChange(nextType: DnsLookupType) {
+    setLookupType(nextType);
+    setLookupError(null);
+    if (!hasEditedInput) {
+      setLookupInput(suggestedDnsLookupInput(nextType, cleanSuggestedDomain));
+    }
+  }
+
+  function useLookupValue(value: string) {
+    setLookupInput(value);
+    setHasEditedInput(true);
+    setLookupError(null);
+    document.getElementById("dns-lookup-name")?.focus();
+  }
+
+  async function copyLookupRecord(value: string, key: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedRecord(key);
+      setCopyMessage("DNS record value copied.");
+      window.setTimeout(() => setCopiedRecord((current) => current === key ? null : current), 1800);
+      window.setTimeout(() => setCopyMessage(""), 2200);
+    } catch {
+      setCopiedRecord(null);
+      setCopyMessage("Copy failed. Select and copy the value manually.");
+      window.setTimeout(() => setCopyMessage(""), 2800);
+    }
+  }
+
+  async function runLookup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const name = lookupInput.trim();
+    if (!name) return;
+
+    lookupControllerRef.current?.abort();
+    const controller = new AbortController();
+    lookupControllerRef.current = controller;
+    const requestedType = lookupType;
+    const timeout = window.setTimeout(() => controller.abort(), 15_000);
+    setLookupLoading(true);
+    setLookupError(null);
+    setLookupResult(null);
+    setCopyMessage("");
+
+    try {
+      const response = await fetch("/api/lookup", {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({ name, type: requestedType }),
+        signal: controller.signal,
+      });
+
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (!contentType.includes("application/json")) {
+        throw new Error("The DNS lookup API is unavailable. Please try again in a moment.");
+      }
+
+      let payload: unknown;
+      try {
+        payload = await response.json();
+      } catch {
+        throw new Error("The DNS lookup API returned an invalid response. Please try again.");
+      }
+
+      if (!response.ok || isScanError(payload)) {
+        throw new Error(isScanError(payload) ? payload.error : "The DNS lookup could not be completed.");
+      }
+      if (!isDnsLookupResult(payload)) {
+        throw new Error("The DNS lookup API returned an incomplete response. Please try again.");
+      }
+
+      if (lookupControllerRef.current !== controller) return;
+      setLookupResult(payload);
+    } catch (error) {
+      if (lookupControllerRef.current !== controller) return;
+      setLookupError(
+        error instanceof DOMException && error.name === "AbortError"
+          ? "The DNS lookup timed out. No absence was inferred; please try again."
+          : error instanceof Error
+            ? error.message
+            : "The DNS lookup could not be completed.",
+      );
+    } finally {
+      window.clearTimeout(timeout);
+      if (lookupControllerRef.current === controller) setLookupLoading(false);
+    }
+  }
+
+  const records = lookupResult
+    ? Array.from(
+        new Map(
+          lookupResult.records.map((record) => [
+            JSON.stringify([record.name.toLowerCase(), record.type.toUpperCase(), record.value]),
+            record,
+          ] as const),
+        ).values(),
+      )
+    : [];
+
+  return (
+    <section className="dns-explorer-section" id="dns-explorer" aria-labelledby="dns-explorer-title">
+      <div className="container">
+        <div className="dns-explorer-heading">
+          <div>
+            <div className="eyebrow"><span /> Advanced DNS explorer</div>
+            <h2 id="dns-explorer-title">Inspect the record behind the result.</h2>
+          </div>
+          <p>
+            Query a specific public DNS owner and inspect the raw answer. This is a record lookup,
+            separate from the domain readiness score above.
+          </p>
+        </div>
+
+        <div className="dns-explorer-card">
+          <form className="dns-lookup-form" onSubmit={(event) => void runLookup(event)}>
+            <div className="dns-lookup-field dns-type-field">
+              <label htmlFor="dns-lookup-type">Record type</label>
+              <select
+                id="dns-lookup-type"
+                value={lookupType}
+                onChange={(event) => handleLookupTypeChange(event.target.value as DnsLookupType)}
+                disabled={lookupLoading}
+              >
+                <optgroup label="Common DNS records">
+                  {COMMON_DNS_LOOKUP_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
+                </optgroup>
+                <optgroup label="DNSSEC and advanced records">
+                  {ADVANCED_DNS_LOOKUP_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
+                </optgroup>
+              </select>
+            </div>
+            <div className="dns-lookup-field">
+              <label htmlFor="dns-lookup-name">{lookupType === "PTR" ? "IP address" : "DNS owner name"}</label>
+              <div className="dns-name-input">
+                <Globe2 aria-hidden="true" />
+                <input
+                  id="dns-lookup-name"
+                  name="dns-lookup-name"
+                  type="text"
+                  inputMode="text"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  autoComplete="off"
+                  spellCheck="false"
+                  value={lookupInput}
+                  onChange={(event) => {
+                    setLookupInput(event.target.value);
+                    setHasEditedInput(true);
+                    setLookupError(null);
+                  }}
+                  placeholder={example}
+                  aria-describedby="dns-lookup-help dns-lookup-scope"
+                  disabled={lookupLoading}
+                  required
+                />
+              </div>
+            </div>
+            <button className="button button-primary dns-lookup-button" type="submit" disabled={lookupLoading || !lookupInput.trim()}>
+              {lookupLoading ? <LoaderCircle className="spin" aria-hidden="true" /> : <FileSearch aria-hidden="true" />}
+              {lookupLoading ? "Looking up" : "Look up record"}
+            </button>
+          </form>
+
+          <div className="dns-lookup-help" id="dns-lookup-help">
+            <p>{hint}</p>
+            <div className="dns-lookup-shortcuts" aria-label="Lookup input shortcuts">
+              <span>Example</span>
+              <button type="button" onClick={() => useLookupValue(example)} disabled={lookupLoading}>
+                <code>{example}</code>
+              </button>
+              {cleanSuggestedDomain && lookupType !== "PTR" && lookupInput !== cleanSuggestedDomain && (
+                <button type="button" onClick={() => useLookupValue(cleanSuggestedDomain)} disabled={lookupLoading}>
+                  Use scanned domain
+                </button>
+              )}
+            </div>
+          </div>
+
+          {lookupError && (
+            <div className="dns-lookup-error" role="alert">
+              <AlertCircle aria-hidden="true" />
+              <span>{lookupError}</span>
+            </div>
+          )}
+
+          {lookupLoading && (
+            <div className="dns-lookup-loading" role="status" aria-live="polite">
+              <LoaderCircle className="spin" aria-hidden="true" />
+              <div><strong>Resolving {lookupInput}</strong><span>Querying the selected public DNS record type.</span></div>
+            </div>
+          )}
+
+          {lookupResult && !lookupLoading && (
+            <div className="dns-lookup-result" aria-live="polite">
+              <div className="dns-result-heading">
+                <span className="dns-type-badge">{lookupResult.type}</span>
+                <div>
+                  <p>Query complete</p>
+                  <h3>{lookupResult.queryName}</h3>
+                </div>
+                <span className="dns-result-meta">
+                  {records.length} answer{records.length === 1 ? "" : "s"} · {(lookupResult.durationMs / 1000).toFixed(2)}s
+                </span>
+              </div>
+              <p className="dns-result-summary">{lookupResult.summary}</p>
+              {lookupResult.input !== lookupResult.queryName && (
+                <div className="dns-query-translation">
+                  <span>Entered</span><code>{lookupResult.input}</code><ChevronRight aria-hidden="true" />
+                  <span>Queried</span><code>{lookupResult.queryName}</code>
+                </div>
+              )}
+
+              {records.length === 0 ? (
+                <div className="dns-empty-state" role="status">
+                  <CircleHelp aria-hidden="true" />
+                  <div>
+                    <strong>No records were returned for this name and type.</strong>
+                    <span>An empty answer is not automatically a fault. The record may be optional, published at a different owner name, or intentionally absent.</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="dns-answer-list" aria-label="Raw DNS answers">
+                  <div className="dns-answer-label"><Code2 aria-hidden="true" /> Raw DNS evidence</div>
+                  {records.map((record, index) => {
+                    const key = `${record.name}-${record.type}-${record.value}-${index}`;
+                    return (
+                      <article className="dns-answer-row" key={key}>
+                        <div className="dns-answer-owner">
+                          <span>{record.type}</span>
+                          <strong>{record.name}</strong>
+                          <small>{record.ttl === undefined ? "TTL not provided" : `TTL ${record.ttl}s`}</small>
+                        </div>
+                        <code>{record.value}</code>
+                        <button
+                          type="button"
+                          onClick={() => void copyLookupRecord(record.value, key)}
+                          aria-label={`Copy ${record.type} record value for ${record.name}`}
+                        >
+                          {copiedRecord === key ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+                          <span>{copiedRecord === key ? "Copied" : "Copy"}</span>
+                        </button>
+                      </article>
+                    );
+                  })}
+                  <span className="sr-only" aria-live="polite">{copyMessage}</span>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="dns-lookup-scope" id="dns-lookup-scope">
+          <Info aria-hidden="true" />
+          <p>
+            This explorer performs point-in-time public DNS record lookups only. It does not test SMTP,
+            blocklists, worldwide propagation, port reachability, or other network services.
+          </p>
         </div>
       </div>
     </section>
@@ -741,6 +1210,7 @@ export default function App() {
             error={error}
           />
         )}
+        <AdvancedDnsExplorer suggestedDomain={result?.domain ?? ""} />
         <HowItWorks />
         <Methodology />
         <Roadmap />

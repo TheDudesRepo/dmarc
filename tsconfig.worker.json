@@ -4,7 +4,7 @@
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.worker.tsbuildinfo",
     "target": "ES2022",
     "lib": ["ES2022", "WebWorker"],
-    "types": ["@cloudflare/workers-types", "node", "vitest/globals"],
+    "types": ["@cloudflare/workers-types", "vitest/globals"],
     "allowJs": false,
     "skipLibCheck": true,
     "esModuleInterop": true,

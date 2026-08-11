@@ -12,7 +12,7 @@ flowchart LR
     U[Browser] -->|POST /api/scan| W[Cloudflare Worker]
     W --> V[Input validation]
     V --> S[Scanner engine]
-    S -->|Bounded node:dns queries| D[Cloudflare DNS-over-HTTPS]
+    S -->|Bounded fixed-endpoint queries| D[Google Public DNS-over-HTTPS]
     S --> P[Deterministic parsers]
     P --> A[Findings and score]
     A -->|Structured JSON| U
@@ -23,7 +23,7 @@ flowchart LR
 
 ### Browser input
 
-The API accepts a single domain value. It rejects email addresses, IP literals, credentials, ports, paths, local names, malformed labels, and overlong values. The user cannot choose the upstream resolver or DNS record type.
+The scan API accepts a single public domain value. It rejects email addresses, IP literals, credentials, ports, paths, local names, malformed labels, and overlong values. The advanced lookup API accepts a validated public DNS owner name and an allowlisted record type; PTR additionally accepts an IP literal and converts it to a reverse owner name. The user cannot choose the upstream resolver or target URL.
 
 ### DNS answers
 
@@ -37,9 +37,9 @@ All resolution uses a fixed HTTPS endpoint. The scanner cannot fetch a URL deriv
 
 1. Validate HTTP method, content type, and body size.
 2. Normalize and validate the requested public domain.
-3. Execute fixed DNS queries with timeouts and a shared budget.
+3. Execute fixed-endpoint DNS-over-HTTPS queries with bounded concurrency, retries, timeouts, response-size limits, and a shared subrequest budget.
 4. Parse TXT record boundaries without combining separate resource records.
-5. Analyze DMARC, SPF, mail routing, transport controls, and limited DKIM selector evidence.
+5. Analyze DMARC, SPF, core DNS health, mail routing, transport controls, and limited DKIM selector evidence.
 6. Produce stable check identifiers and deterministic findings.
 7. Return JSON with `Cache-Control` and security headers.
 

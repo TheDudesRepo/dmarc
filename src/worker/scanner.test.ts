@@ -87,6 +87,64 @@ describe("deterministic scan engine", () => {
       expect.arrayContaining(["dmarc-weaker-sp-policy", "dmarc-weaker-np-policy"]),
     );
   });
+
+  it("accepts the logical myavista SPF record and estimates six recursive lookups", async () => {
+    const domain = "myavista.com";
+    const records: Record<string, DnsAnswer[]> = {
+      [`TXT:_dmarc.${domain}`]: [
+        txt(`_dmarc.${domain}`, "v=DMARC1; p=reject; pct=100; sp=reject; rua=mailto:dmarc@example.com"),
+      ],
+      [`TXT:${domain}`]: [
+        txt(
+          domain,
+          "v=spf1 include:u1791881.wl.sendgrid.net include:spf.protection.outlook.com include:aspmx.pardot.com ip4:198.181.21.221 ip4:198.181.21.222 ip4:198.181.30.101 ip4:198.251.0.114 ip4:198.251.4.1 ip4:198.251.4.2 ip4:198.251.4.3 ip4:198.251.4.4 ip4:198.251.4.5 include:_spf.salesforce.com -all",
+        ),
+      ],
+      "TXT:u1791881.wl.sendgrid.net": [txt("u1791881.wl.sendgrid.net", "v=spf1 ip4:167.89.0.0/17 -all")],
+      "TXT:spf.protection.outlook.com": [txt("spf.protection.outlook.com", "v=spf1 ip4:40.92.0.0/15 -all")],
+      "TXT:aspmx.pardot.com": [txt("aspmx.pardot.com", "v=spf1 include:et._spf.pardot.com -all")],
+      "TXT:et._spf.pardot.com": [txt("et._spf.pardot.com", "v=spf1 ip4:198.245.80.0/20 -all")],
+      "TXT:_spf.salesforce.com": [
+        txt("_spf.salesforce.com", "v=spf1 exists:%{i}._spf.mta.salesforce.com -all"),
+      ],
+      [`NS:${domain}`]: [
+        { name: domain, type: "NS", data: "ns1.example.net" },
+        { name: domain, type: "NS", data: "ns2.example.net" },
+      ],
+      [`SOA:${domain}`]: [
+        { name: domain, type: "SOA", data: "ns1.example.net hostmaster.example.net 1 3600 600 1209600 300" },
+      ],
+    };
+
+    const result = await scanDomain(domain, new FakeResolver(records));
+    const lookupDetail = result.checks.spf.details.find((detail) => detail.label === "Lookup estimate");
+
+    expect(result.checks.spf.status).toBe("pass");
+    expect(lookupDetail?.value).toBe("6");
+    expect(result.findings.map((finding) => finding.id)).not.toContain("invalid-spf-record");
+    expect(result.findings.find((finding) => finding.id === "dmarc-legacy-pct")?.remediation?.record?.value)
+      .toBe("v=DMARC1; p=reject; sp=reject; rua=mailto:dmarc@example.com");
+  });
+
+  it("surfaces DNS health and provides repair steps for a fragile delegation", async () => {
+    const domain = "example.com";
+    const records: Record<string, DnsAnswer[]> = {
+      [`TXT:_dmarc.${domain}`]: [txt(`_dmarc.${domain}`, "v=DMARC1; p=none")],
+      [`TXT:${domain}`]: [txt(domain, "v=spf1 -all")],
+      [`A:${domain}`]: [{ name: domain, type: "A", data: "192.0.2.10", ttl: 300 }],
+      [`NS:${domain}`]: [{ name: domain, type: "NS", data: "ns1.example.net", ttl: 300 }],
+      [`SOA:${domain}`]: [
+        { name: domain, type: "SOA", data: "ns1.example.net hostmaster.example.net 1 3600 600 1209600 300" },
+      ],
+    };
+
+    const result = await scanDomain(domain, new FakeResolver(records));
+    const finding = result.findings.find((candidate) => candidate.id === "dns-single-nameserver");
+
+    expect(result.checks.dns.status).toBe("warning");
+    expect(result.checks.dns.records).toEqual(expect.arrayContaining([expect.objectContaining({ type: "A" })]));
+    expect(finding?.remediation?.steps.length).toBeGreaterThan(1);
+  });
 });
 
 async function scanWithDmarc(record: string) {

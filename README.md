@@ -1,6 +1,6 @@
 # DMARC Ready
 
-DMARC Ready is a public, read-only email-authentication scanner designed to make the path from monitoring to enforcement understandable. Enter a domain to inspect its published DMARC and SPF records, commonly discoverable DKIM selectors, mail routing, and adjacent transport-security controls.
+DMARC Ready is a public, read-only email-authentication and DNS scanner designed to make the path from monitoring to enforcement understandable. Enter a domain to inspect its published DMARC and SPF records, commonly discoverable DKIM selectors, mail routing, adjacent transport-security controls, and core DNS health.
 
 The current release is an intentionally focused MVP: no accounts, no mailbox access, no DNS writes, and no AI-generated enforcement decisions.
 
@@ -11,9 +11,12 @@ The current release is an intentionally focused MVP: no accounts, no mailbox acc
 - Checks aggregate-reporting configuration
 - Detects SPF record conflicts and estimates DNS-producing mechanisms within a strict lookup budget
 - Displays MX and nameserver context
+- Inventories A, AAAA, CNAME, TXT, MX, NS, SOA, and CAA answers in the main scan
 - Looks for MTA-STS, SMTP TLS reporting, and BIMI records
 - Checks a small set of common DKIM selectors without claiming that non-discovery means DKIM is absent
-- Produces deterministic, prioritized findings with raw DNS evidence
+- Provides an advanced lookup for common, DNSSEC, and specialist record types
+- Produces deterministic, prioritized findings with raw DNS evidence and guided remediation
+- Shows copy-ready DNS record templates when a safe template is possible, with deployment cautions
 - Clearly warns that public DNS alone cannot prove a domain is safe to move into enforcement
 
 ## Product principles
@@ -29,11 +32,11 @@ The current release is an intentionally focused MVP: no accounts, no mailbox acc
 - React 19 and TypeScript
 - Vite
 - Cloudflare Workers Static Assets
-- Cloudflare Workers `node:dns` API, backed by DNS-over-HTTPS
+- A fixed, RCODE-aware Google Public DNS-over-HTTPS resolver
 - Vitest
 - Wrangler
 
-The frontend and API Worker deploy as one Cloudflare Worker. Static files are served from the Vite `dist` directory and `/api/*` routes run through the Worker. The `nodejs_compat` flag enables Cloudflare's supported `node:dns` resolver inside the Worker runtime.
+The frontend and API Worker deploy as one Cloudflare Worker. Static files are served from the Vite `dist` directory and `/api/*` routes run through the Worker. DNS requests use one fixed resolver endpoint, bounded concurrency, strict response limits, explicit DNS response-code handling, per-request caching, and a hard subrequest budget.
 
 ## Local development
 
@@ -108,7 +111,20 @@ The endpoint accepts only a public domain name. It does not accept a resolver UR
 
 ### `GET /api/health`
 
-Returns a basic service-health response without performing DNS work.
+Returns a basic service-health response, application version, and Cloudflare deployment identifier without performing DNS work.
+
+### `POST /api/lookup`
+
+Request:
+
+```json
+{
+  "name": "_sip._tcp.example.com",
+  "type": "SRV"
+}
+```
+
+The advanced lookup supports A, AAAA, CAA, CERT, CNAME, DNSKEY, DS, IPSECKEY, LOC, MX, NS, NSEC, NSEC3PARAM, PTR, RRSIG, SOA, SRV, TLSA, and TXT. PTR accepts an IPv4 or IPv6 address and converts it to the corresponding reverse-DNS owner name. An empty answer is evidence that the requested record type was not returned; it is not automatically a configuration failure.
 
 ## Repository layout
 
@@ -130,10 +146,10 @@ DMARC expresses a domain owner's requested handling policy. A receiver ultimatel
 
 ## Security and privacy
 
-- Scans query public DNS records only.
+- Scans query public DNS records only. Query names and record types are sent to Google Public DNS; no user-selectable resolver or target URL is accepted.
 - The MVP does not persist scan history in an application database.
 - DNS answers are untrusted input and are rendered as text.
-- The Worker does not fetch user-supplied URLs.
+- The Worker fetches only a fixed DNS-over-HTTPS endpoint and does not fetch user-supplied URLs.
 - Security headers are applied by the Worker.
 - API requests have strict input and size limits.
 
@@ -145,7 +161,7 @@ See [SECURITY.md](SECURITY.md) for reporting guidance and [docs/ARCHITECTURE.md]
 - Historical sender inventory and change detection
 - Verified ownership and multi-domain accounts
 - Bulk-domain pricing and portfolio dashboards
-- Guided sender remediation
+- Provider-aware sender remediation and change-plan approvals
 - Quarantine/reject change plans with explicit human approval
 - Optional AI explanations using schema-constrained output
 - Billing, RBAC, SSO, audit logs, and enterprise controls

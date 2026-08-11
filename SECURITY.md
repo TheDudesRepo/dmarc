@@ -24,8 +24,11 @@ The scanner intentionally limits:
 - Accepted input shape
 - Domain length and label length
 - DNS query types and names
-- Total lookup count
+- Total lookup count and concurrent upstream connections
 - Recursive SPF depth
 - Upstream request duration
+- Upstream response size and answer count
+
+All DNS resolution uses a fixed Google Public DNS-over-HTTPS endpoint with redirects disabled. DNS response codes are handled explicitly so temporary resolver failures are not converted into absent records. The advanced lookup route accepts only an allowlisted record type and a validated public owner name; it cannot select an upstream host or fetch an arbitrary URL.
 
 Future DMARC aggregate-report ingestion will require additional controls for compressed files, XML entities, expansion ratios, tenant mapping, deduplication, and report-email authentication before it is enabled in production.

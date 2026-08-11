@@ -46,6 +46,28 @@ import type {
 
 const EXAMPLE_DOMAINS = ["google.com", "github.com", "cloudflare.com"];
 
+function isScanResult(value: unknown): value is ScanResult {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<ScanResult>;
+  return (
+    typeof candidate.domain === "string" &&
+    typeof candidate.scannedAt === "string" &&
+    typeof candidate.durationMs === "number" &&
+    typeof candidate.score === "number" &&
+    typeof candidate.grade === "string" &&
+    typeof candidate.posture === "string" &&
+    Boolean(candidate.checks?.dmarc && candidate.checks?.spf && candidate.checks?.dkim && candidate.checks?.transport) &&
+    Array.isArray(candidate.findings) &&
+    Boolean(candidate.metadata)
+  );
+}
+
+function isScanError(value: unknown): value is ScanError {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<ScanError>;
+  return typeof candidate.error === "string" && typeof candidate.code === "string";
+}
+
 const statusIcons: Record<CheckStatus, ReactNode> = {
   pass: <CheckCircle2 aria-hidden="true" />,
   warning: <AlertTriangle aria-hidden="true" />,
@@ -196,7 +218,7 @@ function Hero({
       </div>
       <div className="container proof-strip" aria-label="Checks included">
         <span><Fingerprint aria-hidden="true" /> DMARC policy</span>
-        <span><Network aria-hidden="true" /> SPF alignment</span>
+        <span><Network aria-hidden="true" /> SPF policy</span>
         <span><KeyRound aria-hidden="true" /> DKIM discovery</span>
         <span><MailCheck aria-hidden="true" /> Transport security</span>
       </div>
@@ -225,7 +247,7 @@ function LoadingResults({ domain }: { domain: string }) {
             <p>We are checking independent DNS controls in parallel. No email is sent.</p>
             <div className="loading-steps">
               {steps.map((step, index) => (
-                <div className="loading-step" key={step.label} style={{ animationDelay: `${index * 350}ms` }}>
+                <div className={`loading-step loading-step-${index + 1}`} key={step.label}>
                   {step.icon}<span>{step.label}</span><span className="loading-dots" />
                 </div>
               ))}
@@ -241,9 +263,21 @@ function ScoreRing({ result }: { result: ScanResult }) {
   return (
     <div
       className={`score-ring score-${result.grade.toLowerCase()}`}
-      style={{ "--score": `${result.score * 3.6}deg` } as React.CSSProperties}
+      role="img"
       aria-label={`Published email configuration score ${result.score} out of 100, grade ${result.grade}`}
     >
+      <svg className="score-ring-graphic" viewBox="0 0 188 188" aria-hidden="true">
+        <circle className="score-ring-track" cx="94" cy="94" r="84" />
+        <circle
+          className="score-ring-progress"
+          cx="94"
+          cy="94"
+          r="84"
+          pathLength="100"
+          strokeDasharray={`${result.score} ${100 - result.score}`}
+        />
+        <circle className="score-ring-guide" cx="94" cy="94" r="70" />
+      </svg>
       <div className="score-ring-inner">
         <span className="score-value">{result.score}</span>
         <span className="score-total">/ 100</span>
@@ -283,7 +317,7 @@ function CheckCard({
       <p className="check-summary">{check.summary}</p>
       {check.details.length > 0 && (
         <dl className="check-details">
-          {check.details.slice(0, 3).map((detail) => (
+          {check.details.map((detail) => (
             <div key={`${detail.label}-${detail.value}`}>
               <dt>{detail.label}</dt>
               <dd>{detail.value}</dd>
@@ -381,12 +415,14 @@ function Results({
   setDomain,
   onSubmit,
   loading,
+  error,
 }: {
   result: ScanResult;
   domain: string;
   setDomain: (value: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   loading: boolean;
+  error: string | null;
 }) {
   const criticalCount = result.findings.filter((finding) => finding.severity === "critical").length;
   const warningCount = result.findings.filter((finding) => finding.severity === "warning").length;
@@ -402,6 +438,12 @@ function Results({
           </div>
           <ScanForm compact domain={domain} onDomainChange={setDomain} onSubmit={onSubmit} loading={loading} />
         </div>
+        {error && (
+          <div className="form-error results-error" role="alert">
+            <AlertCircle aria-hidden="true" />
+            <span>{error}</span>
+          </div>
+        )}
 
         <div className="result-hero">
           <ScoreRing result={result} />
@@ -608,7 +650,6 @@ export default function App() {
     const timeout = window.setTimeout(() => controller.abort(), 20_000);
     setLoading(true);
     setError(null);
-    setResult(null);
 
     try {
       const response = await fetch("/api/scan", {
@@ -617,10 +658,27 @@ export default function App() {
         body: JSON.stringify({ domain: value }),
         signal: controller.signal,
       });
-      const payload = (await response.json()) as ScanResult | ScanError;
-      if (!response.ok || "error" in payload) {
-        throw new Error("error" in payload ? payload.error : "The scan could not be completed.");
+
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (!contentType.includes("application/json")) {
+        throw new Error("The scanner API is unavailable. Verify that this site is deployed as a Cloudflare Worker, then try again.");
       }
+
+      let payload: unknown;
+      try {
+        payload = await response.json();
+      } catch {
+        throw new Error("The scanner API returned an invalid response. Please try again in a moment.");
+      }
+
+      if (!response.ok || isScanError(payload)) {
+        throw new Error(isScanError(payload) ? payload.error : "The scan could not be completed.");
+      }
+      if (!isScanResult(payload)) {
+        throw new Error("The scanner API returned an incomplete response. Please try again in a moment.");
+      }
+
+      if (controllerRef.current !== controller) return;
       setDomain(payload.domain);
       setResult(payload);
       const url = new URL(window.location.href);
@@ -628,15 +686,16 @@ export default function App() {
       window.history.replaceState({}, "", url);
       window.setTimeout(() => document.getElementById("results")?.scrollIntoView({ behavior: "smooth" }), 100);
     } catch (scanError) {
+      if (controllerRef.current !== controller) return;
       if (scanError instanceof DOMException && scanError.name === "AbortError") {
         setError("The DNS scan timed out. Please try again in a moment.");
       } else {
         setError(scanError instanceof Error ? scanError.message : "The scan could not be completed.");
       }
-      window.setTimeout(scrollToScanner, 50);
+      if (!result) window.setTimeout(scrollToScanner, 50);
     } finally {
       window.clearTimeout(timeout);
-      setLoading(false);
+      if (controllerRef.current === controller) setLoading(false);
     }
   }
 
@@ -679,6 +738,7 @@ export default function App() {
             setDomain={setDomain}
             onSubmit={handleSubmit}
             loading={loading}
+            error={error}
           />
         )}
         <HowItWorks />

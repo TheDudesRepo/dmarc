@@ -583,6 +583,7 @@ h4,
 
 .loading-card h2 {
   margin-bottom: 9px;
+  overflow-wrap: anywhere;
   font-size: 1.7rem;
   letter-spacing: -0.04em;
 }
@@ -608,6 +609,9 @@ h4,
   opacity: 0.55;
   animation: step-pulse 1.4s ease-in-out infinite alternate;
 }
+
+.loading-step-2 { animation-delay: 350ms; }
+.loading-step-3 { animation-delay: 700ms; }
 
 .loading-step svg {
   color: var(--green-600);
@@ -675,6 +679,7 @@ h4,
 
 .results-toolbar h2 {
   margin-bottom: 3px;
+  overflow-wrap: anywhere;
   font-size: 1.55rem;
   letter-spacing: -0.04em;
 }
@@ -733,30 +738,43 @@ h4,
 
 .score-ring {
   --ring-color: var(--green-500);
-  --score: 0deg;
   position: relative;
   display: grid;
   place-items: center;
   width: 188px;
   height: 188px;
   border-radius: 50%;
-  background: conic-gradient(var(--ring-color) var(--score), #e8efeb 0);
 }
 
-.score-ring::before {
-  content: "";
+.score-ring-graphic {
   position: absolute;
-  inset: 9px;
-  border-radius: inherit;
-  background: white;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
 }
 
-.score-ring::after {
-  content: "";
-  position: absolute;
-  inset: 18px;
-  border: 1px dashed #d8e5df;
-  border-radius: inherit;
+.score-ring-track,
+.score-ring-progress,
+.score-ring-guide {
+  fill: none;
+}
+
+.score-ring-track {
+  stroke: #e8efeb;
+  stroke-width: 10;
+}
+
+.score-ring-progress {
+  stroke: var(--ring-color);
+  stroke-width: 10;
+  stroke-linecap: round;
+}
+
+.score-ring-guide {
+  stroke: #d8e5df;
+  stroke-width: 1;
+  stroke-dasharray: 2 4;
 }
 
 .score-a { --ring-color: #148a64; }
@@ -774,6 +792,14 @@ h4,
   justify-content: center;
   color: var(--ink);
   line-height: 1;
+}
+
+.results-error {
+  max-width: 760px;
+  margin: -12px 0 24px;
+  border-color: #edc4c0;
+  color: #8d2f2a;
+  background: var(--red-soft);
 }
 
 .score-value {

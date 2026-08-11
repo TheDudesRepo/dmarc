@@ -79,7 +79,7 @@ The repository is configured for [Cloudflare Workers Builds](https://developers.
 1. In Cloudflare, open **Workers & Pages**.
 2. Select **Create application** and **Import a repository**.
 3. Select this GitHub repository and the `main` branch.
-4. Keep the Worker name as `dmarc-ready`; it must match `wrangler.jsonc`.
+4. Keep the Worker name as `dmarc`; it must match `wrangler.jsonc` and the connected Cloudflare Worker.
 5. Set the build command to `npm run build`.
 6. Keep the deploy command as `npx wrangler deploy`.
 7. Save and deploy.

@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { DnsLookupType } from "../shared/types";
-import { type DnsAnswer, DnsQueryError, type DnsQueryType } from "./dns";
+import {
+  type DnsAnswer,
+  DnsClient,
+  DnsQueryError,
+  type DnsQueryType,
+  type NativeDnsResolver,
+} from "./dns";
 import {
   DNS_LOOKUP_TYPES,
   type LookupResolver,
@@ -22,6 +28,55 @@ class FakeResolver implements LookupResolver {
     this.calls.push({ name, type });
     return this.failure ? Promise.reject(this.failure) : Promise.resolve(this.answers);
   }
+}
+
+class RoutedResolver implements LookupResolver {
+  readonly calls: Array<{ name: string; type: DnsQueryType }> = [];
+
+  constructor(
+    private readonly answers: Record<string, DnsAnswer[]> = {},
+    private readonly failures = new Set<string>(),
+  ) {}
+
+  query(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
+    this.calls.push({ name, type });
+    const key = `${type}:${name}`;
+    return this.failures.has(key)
+      ? Promise.reject(new DnsQueryError("SERVFAIL"))
+      : Promise.resolve(this.answers[key] ?? []);
+  }
+}
+
+const MYAVISTA_SPF_WORKERD =
+  'v=spf1 include:u1791881.wl.sendgrid.net include:spf.protection.outlook.com include:aspmx.pardot.com ip4:198.181.21.221 ip4:198.181.21.222 ip4:198.181.30.101 ip4:198.251.0.114 ip4:198.251.4.1 ip4:198.251.4.2 ip4:198.251.4.3 ip4:198.251.4.4 ip4:198.251.4.5 " "include:_spf.salesforce.com -all';
+const MYAVISTA_SPF = MYAVISTA_SPF_WORKERD.replace('" "', "");
+
+function txt(name: string, data: string, ttl?: number): DnsAnswer {
+  return { name, type: "TXT", data, ...(ttl === undefined ? {} : { ttl }) };
+}
+
+function nativeResolver(overrides: Partial<NativeDnsResolver> = {}): NativeDnsResolver {
+  return {
+    resolve4: async () => [],
+    resolve6: async () => [],
+    resolveCaa: async () => [],
+    resolveCname: async () => [],
+    resolveMx: async () => [],
+    resolveNs: async () => [],
+    resolvePtr: async () => [],
+    resolveSoa: async () => ({
+      nsname: "ns1.example.com",
+      hostmaster: "hostmaster.example.com",
+      serial: 1,
+      refresh: 7_200,
+      retry: 3_600,
+      expire: 1_209_600,
+      minttl: 300,
+    }),
+    resolveSrv: async () => [],
+    resolveTxt: async () => [],
+    ...overrides,
+  };
 }
 
 describe("DNS lookup request validation", () => {
@@ -53,6 +108,20 @@ describe("DNS lookup request validation", () => {
     expect(normalizeLookupRequest("Selector._DomainKey.Example.COM", "TXT").queryName).toBe(
       "selector._domainkey.example.com",
     );
+    expect(normalizeLookupRequest("  BÜCHER.Example.COM. ", "SPF")).toEqual({
+      input: "xn--bcher-kva.example.com",
+      queryName: "xn--bcher-kva.example.com",
+      type: "SPF",
+    });
+  });
+
+  it("accepts a normalized public SPF policy owner and still rejects IP literals", () => {
+    expect(normalizeLookupRequest("_SPF.Example.COM.", "SPF")).toEqual({
+      input: "_spf.example.com",
+      queryName: "_spf.example.com",
+      type: "SPF",
+    });
+    expect(() => normalizeLookupRequest("192.0.2.1", "SPF")).toThrow(LookupValidationError);
   });
 
   it.each([
@@ -186,6 +255,191 @@ describe("lookupDns", () => {
   it("maps resolver failures to a lookup upstream error", async () => {
     await expect(
       lookupDns("example.com", "A", new FakeResolver([], new DnsQueryError("SERVFAIL"))),
+    ).rejects.toBeInstanceOf(LookupUpstreamError);
+  });
+
+  it("returns only SPF TXT evidence and a neutral missing analysis when no policy exists", async () => {
+    const resolver = new FakeResolver([
+      txt("example.com", "google-site-verification=abc", 300),
+      txt("example.com", "some unrelated TXT value", 600),
+    ]);
+
+    const result = await lookupDns("example.com", "SPF", resolver);
+
+    expect(resolver.calls).toEqual([{ name: "example.com", type: "TXT" }]);
+    expect(result.type).toBe("SPF");
+    expect(result.records).toEqual([]);
+    expect(result.summary).toMatch(/No SPF policy was found/u);
+    expect(result.spfAnalysis).toEqual(expect.objectContaining({
+      status: "missing",
+      recordCount: 0,
+      valid: false,
+      syntaxValid: false,
+      mechanisms: [],
+      terminalPolicy: "none",
+    }));
+    expect(result.spfAnalysis?.correctionGuidance.steps).toHaveLength(3);
+  });
+
+  it("classifies multiple SPF policies as permerror and returns both raw records", async () => {
+    const resolver = new FakeResolver([
+      txt("example.com", "v=spf1 include:mail.example.net -all", 300),
+      txt("example.com", "v=spf1 ip4:192.0.2.0/24 ~all", 600),
+      txt("example.com", "verification=not-spf", 600),
+    ]);
+
+    const result = await lookupDns("example.com", "SPF", resolver);
+
+    expect(result.records).toHaveLength(2);
+    expect(result.records.every((record) => record.type === "TXT" && record.value.startsWith("v=spf1"))).toBe(true);
+    expect(result.spfAnalysis).toEqual(expect.objectContaining({
+      status: "multiple",
+      recordCount: 2,
+      valid: false,
+      syntaxValid: false,
+    }));
+    expect(result.spfAnalysis?.errors.join(" ")).toMatch(/exactly one|multiple/iu);
+  });
+
+  it("reports parser errors, parsed mechanisms, and targeted repair guidance for an invalid policy", async () => {
+    const result = await lookupDns("example.com", "SPF", new FakeResolver([
+      txt("example.com", "v=spf1 ip4:not-an-address include:mail.example.net -all"),
+    ]));
+
+    expect(result.spfAnalysis).toEqual(expect.objectContaining({
+      status: "invalid",
+      recordCount: 1,
+      valid: false,
+      syntaxValid: false,
+      terminalPolicy: "-all",
+    }));
+    expect(result.spfAnalysis?.errors.join(" ")).toMatch(/invalid IPv4/iu);
+    expect(result.spfAnalysis?.mechanisms).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "include", domainSpec: "mail.example.net", causesDnsLookup: true }),
+      expect.objectContaining({ name: "all", qualifier: "-", causesDnsLookup: false }),
+    ]));
+    expect(result.spfAnalysis?.correctionGuidance.summary).toMatch(/Repair the existing SPF/iu);
+  });
+
+  it("bounds parser messages and correction guidance for a large allowed TXT response", async () => {
+    const oversizedToken = "x".repeat(20_000);
+    const result = await lookupDns("example.com", "SPF", new FakeResolver([
+      txt("example.com", `v=spf1 ${oversizedToken} ${oversizedToken}=value -all`),
+    ]));
+    const analysis = result.spfAnalysis;
+
+    expect(analysis?.status).toBe("invalid");
+    expect(analysis?.errors.every((message) => message.length <= 8_192)).toBe(true);
+    expect(analysis?.warnings.every((message) => message.length <= 8_192)).toBe(true);
+    expect(analysis?.correctionGuidance.steps.every((step) => step.length <= 8_192)).toBe(true);
+    expect(analysis?.issues.join(" ")).toMatch(/Parser messages were limited/iu);
+  });
+
+  it("marks a syntactically valid policy invalid when its evaluation path exceeds ten lookups", async () => {
+    const elevenLookups = Array.from({ length: 11 }, () => "a").join(" ");
+    const result = await lookupDns("example.com", "SPF", new FakeResolver([
+      txt("example.com", `v=spf1 ${elevenLookups} -all`),
+    ]));
+
+    expect(result.spfAnalysis).toEqual(expect.objectContaining({
+      status: "invalid",
+      valid: false,
+      syntaxValid: true,
+      terminalPolicy: "-all",
+      lookupEstimate: expect.objectContaining({
+        count: 11,
+        exceedsLimit: true,
+        truncated: false,
+      }),
+    }));
+    expect(result.spfAnalysis?.issues.join(" ")).toMatch(/above the RFC limit of 10/iu);
+    expect(result.spfAnalysis?.correctionGuidance.summary).toMatch(/ten DNS lookups or fewer/iu);
+  });
+
+  it("bounds structured SPF mechanism output without losing the terminal-policy conclusion", async () => {
+    const manyIpMechanisms = Array.from({ length: 257 }, () => "ip4:192.0.2.1").join(" ");
+    const result = await lookupDns("example.com", "SPF", new FakeResolver([
+      txt("example.com", `v=spf1 ${manyIpMechanisms} -all`),
+    ]));
+
+    expect(result.spfAnalysis).toEqual(expect.objectContaining({
+      status: "warning",
+      valid: true,
+      syntaxValid: true,
+      terminalPolicy: "-all",
+    }));
+    expect(result.spfAnalysis?.mechanisms).toHaveLength(256);
+    expect(result.spfAnalysis?.issues.join(" ")).toMatch(/limited to the first 256/iu);
+  });
+
+  it("repairs MyAvista split TXT presentation and calculates its six-lookup recursive path", async () => {
+    const includeRecords: Record<string, string> = {
+      "u1791881.wl.sendgrid.net": "v=spf1 ip4:167.89.0.0/17 -all",
+      "spf.protection.outlook.com": "v=spf1 ip4:40.92.0.0/15 -all",
+      "aspmx.pardot.com": "v=spf1 include:et._spf.pardot.com -all",
+      "et._spf.pardot.com": "v=spf1 ip4:198.245.80.0/20 -all",
+      "_spf.salesforce.com": "v=spf1 exists:%{i}._spf.mta.salesforce.com -all",
+    };
+    const resolver = nativeResolver({
+      resolveTxt: async (name) => {
+        if (name === "myavista.com") {
+          return [[MYAVISTA_SPF_WORKERD], ["google-site-verification=not-spf"]];
+        }
+        const record = includeRecords[name];
+        return record ? [[record]] : [];
+      },
+    });
+
+    const result = await lookupDns("MyAvista.COM.", "SPF", new DnsClient({ resolver }));
+
+    expect(result.records).toEqual([
+      { name: "myavista.com", type: "TXT", value: MYAVISTA_SPF },
+    ]);
+    expect(result.records[0]?.value).not.toContain('" "');
+    expect(result.spfAnalysis).toEqual(expect.objectContaining({
+      status: "valid",
+      recordCount: 1,
+      valid: true,
+      syntaxValid: true,
+      terminalPolicy: "-all",
+      lookupEstimate: expect.objectContaining({
+        count: 6,
+        exceedsLimit: false,
+        truncated: false,
+        expandedDomains: [
+          "_spf.salesforce.com",
+          "aspmx.pardot.com",
+          "et._spf.pardot.com",
+          "spf.protection.outlook.com",
+          "u1791881.wl.sendgrid.net",
+        ],
+      }),
+    }));
+    expect(result.spfAnalysis?.errors).toEqual([]);
+    expect(result.spfAnalysis?.issues).toEqual([]);
+  });
+
+  it("keeps an included-domain resolver failure explicit instead of treating the branch as absent", async () => {
+    const resolver = new RoutedResolver(
+      { "TXT:example.com": [txt("example.com", "v=spf1 include:unavailable.example.net -all")] },
+      new Set(["TXT:unavailable.example.net"]),
+    );
+
+    const result = await lookupDns("example.com", "SPF", resolver);
+
+    expect(result.spfAnalysis).toEqual(expect.objectContaining({
+      status: "warning",
+      valid: true,
+      syntaxValid: true,
+      lookupEstimate: expect.objectContaining({ count: 1, exceedsLimit: false }),
+    }));
+    expect(result.spfAnalysis?.issues.join(" ")).toMatch(/Could not resolve.*unavailable\.example\.net/iu);
+    expect(result.spfAnalysis?.correctionGuidance.summary).toMatch(/incomplete SPF branches/iu);
+  });
+
+  it("maps a root SPF TXT resolver failure to a lookup upstream error", async () => {
+    await expect(
+      lookupDns("example.com", "SPF", new FakeResolver([], new DnsQueryError("SERVFAIL"))),
     ).rejects.toBeInstanceOf(LookupUpstreamError);
   });
 });

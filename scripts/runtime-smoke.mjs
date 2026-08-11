@@ -82,6 +82,7 @@ try {
   const health = await requestJson("/api/health");
   assert.equal(health.response.status, 200);
   assert.equal(health.body.status, "ok");
+  assert.equal(health.body.version, "0.3.0");
 
   for (const lookup of directLookupCases) {
     const result = await postJson("/api/lookup", lookup);
@@ -102,6 +103,64 @@ try {
   const nullMx = await postJson("/api/lookup", { name: "null-mx.example.com", type: "MX" });
   assert.equal(nullMx.response.status, 200);
   assert.equal(nullMx.body.records[0]?.value, "0 .");
+
+  const snapshotQueryStart = outboundQueries.length;
+  const snapshot = await postJson("/api/dns-snapshot", { domain: "toolbox.example.com" });
+  const snapshotQueryCount = outboundQueries.length - snapshotQueryStart;
+  assert.equal(snapshot.response.status, 200, JSON.stringify(snapshot.body));
+  assert.equal(snapshot.body.domain, "toolbox.example.com");
+  assert.equal(snapshot.body.groups.length, 8);
+  assert.equal(snapshot.body.groups.find(({ type }) => type === "A")?.status, "found");
+  assert.equal(snapshot.body.groups.find(({ type }) => type === "TXT")?.records[0]?.value, "v=spf1 -all");
+  assert.equal(snapshot.body.securityRecords.find(({ key }) => key === "dmarc")?.status, "found");
+  assert.ok(snapshot.body.infrastructureHosts.some(({ hostname }) => hostname === "mx.toolbox.example.com"));
+  assert.ok(snapshot.body.infrastructureHosts.some(({ hostname }) => hostname === "ns1.toolbox.example.com"));
+  assert.ok(snapshotQueryCount > 0 && snapshotQueryCount < 48, `snapshot used ${snapshotQueryCount} DNS attempts`);
+
+  const discoveryCases = [
+    { profile: "core", expectedHost: "www.toolbox.example.com" },
+    { profile: "extended", expectedHost: "status.toolbox.example.com" },
+  ];
+  const discoveryQueryCounts = [];
+  for (const discoveryCase of discoveryCases) {
+    const queryStart = outboundQueries.length;
+    const discovery = await postJson("/api/host-discovery", {
+      domain: "toolbox.example.com",
+      profile: discoveryCase.profile,
+    });
+    const queryCount = outboundQueries.length - queryStart;
+    discoveryQueryCounts.push(queryCount);
+    assert.equal(discovery.response.status, 200, `${discoveryCase.profile}: ${JSON.stringify(discovery.body)}`);
+    assert.equal(discovery.body.domain, "toolbox.example.com");
+    assert.equal(discovery.body.profile, discoveryCase.profile);
+    assert.equal(discovery.body.testedNames.length, 7);
+    assert.ok(discovery.body.hosts.some(({ hostname }) => hostname === discoveryCase.expectedHost));
+    assert.match(discovery.body.wildcardProbe.hostname, /^dmarc-ready-probe-[a-f0-9]{16}\.toolbox\.example\.com$/u);
+    assert.equal(discovery.body.wildcardProbe.detected, false);
+    assert.equal(discovery.body.wildcardProbe.unavailable, false);
+    assert.ok(queryCount > 0 && queryCount < 48, `${discoveryCase.profile} discovery used ${queryCount} DNS attempts`);
+  }
+
+  const ipQueryStart = outboundQueries.length;
+  const ipResult = await postJson("/api/ip-network", { input: "8.8.4.4" });
+  const ipQueryCount = outboundQueries.length - ipQueryStart;
+  assert.equal(ipResult.response.status, 200, JSON.stringify(ipResult.body));
+  assert.equal(ipResult.body.canonical, "8.8.4.4/32");
+  assert.equal(ipResult.body.classification.kind, "global");
+  assert.deepEqual(ipResult.body.enrichment.ptr.names, ["dns.google"]);
+  assert.equal(ipResult.body.enrichment.origin.record.asn, "15169");
+  assert.equal(ipResult.body.enrichment.origin.record.prefix, "8.8.4.0/24");
+  assert.equal(ipResult.body.enrichment.asName.name, "GOOGLE, US");
+  assert.equal(ipResult.body.enrichment.queryCount, 3);
+  assert.ok(ipQueryCount > 0 && ipQueryCount < 16, `IP enrichment used ${ipQueryCount} DNS attempts`);
+
+  const subnetQueryStart = outboundQueries.length;
+  const subnetResult = await postJson("/api/ip-network", { input: "192.168.7.42/255.255.255.0" });
+  assert.equal(subnetResult.response.status, 200, JSON.stringify(subnetResult.body));
+  assert.equal(subnetResult.body.networkCidr, "192.168.7.0/24");
+  assert.equal(subnetResult.body.ipv4.netmask, "255.255.255.0");
+  assert.equal(subnetResult.body.enrichment.status, "not-applicable");
+  assert.equal(outboundQueries.length - subnetQueryStart, 0, "subnet calculation must not perform DNS queries");
 
   const myAvistaScan = await postJson("/api/scan", { domain: "myavista.com" });
   assert.equal(myAvistaScan.response.status, 200, JSON.stringify(myAvistaScan.body));
@@ -130,6 +189,10 @@ try {
   assert.equal(invalidName.response.status, 400);
   assert.equal(invalidName.body.code, "BAD_REQUEST");
 
+  const invalidIp = await postJson("/api/ip-network", { input: "https://127.0.0.1/admin" });
+  assert.equal(invalidIp.response.status, 400);
+  assert.equal(invalidIp.body.code, "BAD_REQUEST");
+
   const wrongMethod = await requestJson("/api/lookup");
   assert.equal(wrongMethod.response.status, 405);
   assert.equal(wrongMethod.response.headers.get("allow"), "POST");
@@ -148,7 +211,7 @@ try {
   );
 
   console.log(
-    `Runtime smoke passed: ${directLookupCases.length} native DNS types, 7 alias paths, null MX, MyAvista SPF/DKIM/DMARC, and API boundaries.`,
+    `Runtime smoke passed: ${directLookupCases.length} native DNS types, 7 alias paths, null MX, MyAvista SPF/DKIM/DMARC, DNS snapshot (${snapshotQueryCount} queries), core/extended discovery (${discoveryQueryCounts.join("/")} queries), IP enrichment (${ipQueryCount} queries), subnet arithmetic, and API boundaries.`,
   );
 } finally {
   await miniflare.dispose();
@@ -219,6 +282,43 @@ function fixtureAnswers(name, type) {
     "SOA:target.example.com": [answer(name, "SOA", "ns1.target.example.com. hostmaster.target.example.com. 2 3600 600 1209600 300")],
     "CAA:target.example.com": [answer(name, "CAA", '0 issue "letsencrypt.org"')],
     "MX:null-mx.example.com": [answer(name, "MX", "0 .")],
+    "A:toolbox.example.com": [answer(name, "A", "192.0.2.20")],
+    "AAAA:toolbox.example.com": [answer(name, "AAAA", "2001:db8::20")],
+    "CAA:toolbox.example.com": [answer(name, "CAA", '0 issue "letsencrypt.org"')],
+    "MX:toolbox.example.com": [answer(name, "MX", "10 mx.toolbox.example.com.")],
+    "NS:toolbox.example.com": [answer(name, "NS", "ns1.toolbox.example.com.")],
+    "SOA:toolbox.example.com": [
+      answer(name, "SOA", "ns1.toolbox.example.com. hostmaster.toolbox.example.com. 2026081101 3600 600 1209600 300"),
+    ],
+    "TXT:toolbox.example.com": [answer(name, "TXT", '"v=spf1 -all"')],
+    "TXT:_dmarc.toolbox.example.com": [
+      answer(name, "TXT", '"v=DMARC1; p=quarantine; rua=mailto:dmarc@toolbox.example.com"'),
+    ],
+    "TXT:_mta-sts.toolbox.example.com": [answer(name, "TXT", '"v=STSv1; id=20260811"')],
+    "TXT:_smtp._tls.toolbox.example.com": [
+      answer(name, "TXT", '"v=TLSRPTv1; rua=mailto:tls@toolbox.example.com"'),
+    ],
+    "TXT:default._bimi.toolbox.example.com": [
+      answer(name, "TXT", '"v=BIMI1; l=https://toolbox.example.com/logo.svg"'),
+    ],
+    "A:mx.toolbox.example.com": [answer(name, "A", "192.0.2.30")],
+    "AAAA:mx.toolbox.example.com": [answer(name, "AAAA", "2001:db8::30")],
+    "A:ns1.toolbox.example.com": [answer(name, "A", "192.0.2.53")],
+    "A:www.toolbox.example.com": [answer(name, "A", "192.0.2.101")],
+    "CNAME:mail.toolbox.example.com": [answer(name, "CNAME", "mail.discovery.example.net.")],
+    "A:mail.discovery.example.net": [answer(name, "A", "192.0.2.102")],
+    "AAAA:api.toolbox.example.com": [answer(name, "AAAA", "2001:db8::103")],
+    "A:status.toolbox.example.com": [answer(name, "A", "192.0.2.104")],
+    "PTR:101.2.0.192.in-addr.arpa": [answer(name, "PTR", "www-edge.toolbox.example.com.")],
+    "PTR:102.2.0.192.in-addr.arpa": [answer(name, "PTR", "mail-edge.toolbox.example.com.")],
+    "PTR:104.2.0.192.in-addr.arpa": [answer(name, "PTR", "status-edge.toolbox.example.com.")],
+    "PTR:4.4.8.8.in-addr.arpa": [answer(name, "PTR", "dns.google.")],
+    "TXT:4.4.8.8.origin.asn.cymru.com": [
+      answer(name, "TXT", '"15169 | 8.8.4.0/24 | US | arin | 1992-12-01"'),
+    ],
+    "TXT:as15169.asn.cymru.com": [
+      answer(name, "TXT", '"15169 | US | arin | 2000-03-30 | GOOGLE, US"'),
+    ],
     "TXT:myavista.com": [answer(name, "TXT", myAvistaSpfPresentation)],
     "MX:myavista.com": [answer(name, "MX", "10 myavista-com.mail.protection.outlook.com.")],
     "NS:myavista.com": [

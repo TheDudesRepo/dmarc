@@ -39,12 +39,16 @@ import type {
   CheckResult,
   CheckStatus,
   DnsLookupResult,
+  DnsLookupMode,
   DnsLookupType,
   Finding,
   FindingSeverity,
   ScanError,
   ScanResult,
+  SpfLookupAnalysis,
 } from "../shared/types";
+import { DnsSurfaceScanner } from "./DnsSurfaceScanner";
+import { IpNetworkTool } from "./IpNetworkTool";
 
 const EXAMPLE_DOMAINS = ["google.com", "github.com", "cloudflare.com"];
 
@@ -61,16 +65,23 @@ export const DNS_LOOKUP_TYPES: readonly DnsLookupType[] = [
   "PTR",
 ];
 
-const DNS_LOOKUP_TYPE_SET = new Set<string>(DNS_LOOKUP_TYPES);
+export const DNS_LOOKUP_MODES: readonly DnsLookupMode[] = ["SPF", ...DNS_LOOKUP_TYPES];
 
-const DNS_LOOKUP_HINTS: Partial<Record<DnsLookupType, string>> = {
+const DNS_LOOKUP_MODE_SET = new Set<string>(DNS_LOOKUP_MODES);
+
+const DNS_LOOKUP_HINTS: Partial<Record<DnsLookupMode, string>> = {
+  SPF: "Enter a sending domain or public SPF policy owner such as _spf.example.com. SPF is analyzed from TXT; obsolete RR type 99 is not queried.",
   TXT: "Use the exact owner name, such as selector._domainkey.example.com for a DKIM key.",
   CNAME: "Use the alias owner name, such as www.example.com.",
   SRV: "Service records use _service._protocol, such as _sip._tcp.example.com.",
   PTR: "Enter an IPv4 or IPv6 address; the server converts it to the reverse-DNS owner name.",
 };
 
-const DNS_LOOKUP_GUIDANCE: Record<DnsLookupType, { present: string; empty: string }> = {
+const DNS_LOOKUP_GUIDANCE: Record<DnsLookupMode, { present: string; empty: string }> = {
+  SPF: {
+    present: "Use the analyzer evidence below. Keep one policy, validate every sender, and keep the evaluated path within ten DNS lookups.",
+    empty: "Do not guess an SPF value. Inventory every legitimate envelope-from sender, then publish one provider-reviewed v=spf1 TXT record.",
+  },
   A: {
     present: "Confirm each address belongs to the intended web, application, or edge provider before changing it.",
     empty: "Only add an A record if this exact name needs IPv4 service; use the address supplied by the hosting provider.",
@@ -117,6 +128,7 @@ const CHECK_STATUS_SET = new Set(["pass", "warning", "fail", "info", "unknown"])
 const FINDING_SEVERITY_SET = new Set(["critical", "warning", "success", "info"]);
 const SCAN_GRADE_SET = new Set(["A", "B", "C", "D", "F"]);
 const SCAN_POSTURE_SET = new Set(["reject", "quarantine", "monitoring", "missing", "invalid"]);
+const SCAN_ERROR_CODE_SET = new Set(["INVALID_DOMAIN", "METHOD_NOT_ALLOWED", "BAD_REQUEST", "UPSTREAM_ERROR", "NOT_FOUND"]);
 
 export function isScanResult(value: unknown): value is ScanResult {
   if (!isObjectRecord(value)) return false;
@@ -261,14 +273,21 @@ function isIsoDate(value: unknown): value is string {
 }
 
 function isScanError(value: unknown): value is ScanError {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Partial<ScanError>;
-  return typeof candidate.error === "string" && typeof candidate.code === "string";
+  return isObjectRecord(value) &&
+    isBoundedString(value.error, 8_192) &&
+    typeof value.code === "string" &&
+    SCAN_ERROR_CODE_SET.has(value.code);
 }
 
-export function isDnsLookupResult(value: unknown, expectedType?: DnsLookupType): value is DnsLookupResult {
+const SPF_LOOKUP_STATUS_SET = new Set(["missing", "multiple", "invalid", "warning", "valid"]);
+const SPF_TERMINAL_POLICY_SET = new Set(["+all", "-all", "~all", "?all", "none"]);
+
+export function isDnsLookupResult(
+  value: unknown,
+  expectedType?: DnsLookupMode,
+): value is DnsLookupResult<DnsLookupMode> {
   if (!value || typeof value !== "object") return false;
-  const candidate = value as Partial<DnsLookupResult>;
+  const candidate = value as Partial<DnsLookupResult<DnsLookupMode>>;
   return (
     typeof candidate.input === "string" &&
     candidate.input.length > 0 &&
@@ -285,7 +304,7 @@ export function isDnsLookupResult(value: unknown, expectedType?: DnsLookupType):
       )
     ) &&
     typeof candidate.type === "string" &&
-    DNS_LOOKUP_TYPE_SET.has(candidate.type) &&
+    DNS_LOOKUP_MODE_SET.has(candidate.type) &&
     (expectedType === undefined || candidate.type === expectedType) &&
     typeof candidate.scannedAt === "string" &&
     !Number.isNaN(Date.parse(candidate.scannedAt)) &&
@@ -303,7 +322,7 @@ export function isDnsLookupResult(value: unknown, expectedType?: DnsLookupType):
       typeof record.name === "string" &&
       record.name.length > 0 &&
       record.name.length <= 253 &&
-      record.type === candidate.type &&
+      record.type === (candidate.type === "SPF" ? "TXT" : candidate.type) &&
       typeof record.value === "string" &&
       record.value.length <= 262_144 &&
       (
@@ -315,11 +334,67 @@ export function isDnsLookupResult(value: unknown, expectedType?: DnsLookupType):
           record.ttl <= 2 ** 32 - 1
         )
       )
-    ))
+    )) &&
+    (
+      candidate.type === "SPF"
+        ? isSpfLookupAnalysis(candidate.spfAnalysis)
+        : candidate.spfAnalysis === undefined
+    )
   );
 }
 
-function dnsLookupExample(type: DnsLookupType, suggestedDomain: string): string {
+function isSpfLookupAnalysis(value: unknown): value is SpfLookupAnalysis {
+  if (!isObjectRecord(value)) return false;
+  const estimate = value.lookupEstimate;
+  const guidance = value.correctionGuidance;
+  return (
+    typeof value.status === "string" &&
+    SPF_LOOKUP_STATUS_SET.has(value.status) &&
+    typeof value.recordCount === "number" &&
+    Number.isInteger(value.recordCount) &&
+    value.recordCount >= 0 &&
+    value.recordCount <= 256 &&
+    typeof value.valid === "boolean" &&
+    typeof value.syntaxValid === "boolean" &&
+    Array.isArray(value.mechanisms) &&
+    value.mechanisms.length <= 256 &&
+    value.mechanisms.every((mechanism) => (
+      isObjectRecord(mechanism) &&
+      isBoundedString(mechanism.raw, 8_192) &&
+      (mechanism.qualifier === "+" || mechanism.qualifier === "-" || mechanism.qualifier === "~" || mechanism.qualifier === "?") &&
+      isBoundedString(mechanism.name, 64) &&
+      (mechanism.domainSpec === undefined || isBoundedString(mechanism.domainSpec, 512)) &&
+      (mechanism.cidr4 === undefined || (Number.isInteger(mechanism.cidr4) && Number(mechanism.cidr4) >= 0 && Number(mechanism.cidr4) <= 32)) &&
+      (mechanism.cidr6 === undefined || (Number.isInteger(mechanism.cidr6) && Number(mechanism.cidr6) >= 0 && Number(mechanism.cidr6) <= 128)) &&
+      typeof mechanism.causesDnsLookup === "boolean"
+    )) &&
+    typeof value.terminalPolicy === "string" &&
+    SPF_TERMINAL_POLICY_SET.has(value.terminalPolicy) &&
+    (
+      estimate === undefined ||
+      (
+        isObjectRecord(estimate) &&
+        typeof estimate.count === "number" &&
+        Number.isInteger(estimate.count) &&
+        estimate.count >= 0 &&
+        estimate.count <= 10_000 &&
+        typeof estimate.exceedsLimit === "boolean" &&
+        typeof estimate.truncated === "boolean" &&
+        isBoundedStringArray(estimate.expandedDomains, 256, 253) &&
+        isBoundedStringArray(estimate.issues, 256, 8_192)
+      )
+    ) &&
+    isBoundedStringArray(value.warnings, 256, 8_192) &&
+    isBoundedStringArray(value.errors, 256, 8_192) &&
+    isBoundedStringArray(value.issues, 256, 8_192) &&
+    isObjectRecord(guidance) &&
+    isBoundedString(guidance.summary, 8_192) &&
+    isBoundedStringArray(guidance.steps, 32, 8_192) &&
+    (guidance.caution === undefined || isBoundedString(guidance.caution, 8_192))
+  );
+}
+
+function dnsLookupExample(type: DnsLookupMode, suggestedDomain: string): string {
   const domain = suggestedDomain || "example.com";
   if (type === "PTR") return "8.8.8.8";
   if (type === "TXT") return `selector._domainkey.${domain}`;
@@ -328,7 +403,7 @@ function dnsLookupExample(type: DnsLookupType, suggestedDomain: string): string 
   return domain;
 }
 
-function suggestedDnsLookupInput(type: DnsLookupType, suggestedDomain: string): string {
+function suggestedDnsLookupInput(type: DnsLookupMode, suggestedDomain: string): string {
   if (!suggestedDomain || type === "PTR") return "";
   if (type === "CNAME" || type === "SRV") {
     return dnsLookupExample(type, suggestedDomain);
@@ -336,7 +411,7 @@ function suggestedDnsLookupInput(type: DnsLookupType, suggestedDomain: string): 
   return suggestedDomain;
 }
 
-function canPreserveLookupInput(value: string, currentType: DnsLookupType, nextType: DnsLookupType): boolean {
+function canPreserveLookupInput(value: string, currentType: DnsLookupMode, nextType: DnsLookupMode): boolean {
   if (!value) return false;
   if (currentType === "PTR" && nextType !== "PTR") return false;
   if (nextType !== "PTR") return true;
@@ -380,7 +455,8 @@ function Header() {
         <Brand />
         <nav className="desktop-nav" aria-label="Primary navigation">
           <a href="#dns-explorer">DNS tools</a>
-          <a href="#how-it-works">How it works</a>
+          <a href="#dns-surface">Surface scan</a>
+          <a href="#ip-tools">IP tools</a>
           <a href="#methodology">Methodology</a>
           <a href="#roadmap">Roadmap</a>
         </nav>
@@ -915,11 +991,81 @@ function Results({
   );
 }
 
+function SpfAnalysisPanel({ analysis }: { analysis: SpfLookupAnalysis }) {
+  const lookupCount = analysis.lookupEstimate?.count;
+  const messages = [...analysis.errors, ...analysis.issues, ...analysis.warnings];
+  const statusLabel: Record<SpfLookupAnalysis["status"], string> = {
+    valid: "Valid",
+    warning: "Review needed",
+    invalid: "Invalid",
+    multiple: "Permanent error",
+    missing: "Not found",
+  };
+
+  return (
+    <div className={`spf-analysis spf-analysis-${analysis.status}`}>
+      <div className="spf-analysis-heading">
+        <div>
+          <span className="spf-analysis-kicker"><MailCheck aria-hidden="true" /> SPF policy analysis</span>
+          <h4>{statusLabel[analysis.status]}</h4>
+        </div>
+        <span className="spf-status-pill">{statusLabel[analysis.status]}</span>
+      </div>
+
+      <div className="spf-metrics" aria-label="SPF analysis summary">
+        <div><span>Policy records</span><strong>{analysis.recordCount}</strong></div>
+        <div>
+          <span>Lookup estimate</span>
+          <strong>{lookupCount === undefined ? "—" : `${lookupCount} / 10`}</strong>
+        </div>
+        <div><span>Terminal policy</span><strong><code>{analysis.terminalPolicy}</code></strong></div>
+      </div>
+
+      {analysis.mechanisms.length > 0 && (
+        <div className="spf-mechanisms">
+          <strong>Evaluated mechanisms</strong>
+          <div>
+            {analysis.mechanisms.map((mechanism, index) => (
+              <span className={mechanism.causesDnsLookup ? "spf-mechanism spf-mechanism-lookup" : "spf-mechanism"} key={`${mechanism.raw}-${index}`}>
+                <code>{mechanism.raw}</code>
+                {mechanism.causesDnsLookup && <small>DNS</small>}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {analysis.lookupEstimate && analysis.lookupEstimate.expandedDomains.length > 0 && (
+        <div className="spf-expanded-domains">
+          <strong>Expanded include and redirect domains</strong>
+          <p>{analysis.lookupEstimate.expandedDomains.join(" · ")}</p>
+        </div>
+      )}
+
+      {messages.length > 0 && (
+        <div className="spf-analysis-messages">
+          <strong>Evidence to review</strong>
+          <ul>{messages.map((message, index) => <li key={`${message}-${index}`}>{message}</li>)}</ul>
+        </div>
+      )}
+
+      <div className="spf-correction-plan">
+        <div><ServerCog aria-hidden="true" /><strong>How to correct or maintain it</strong></div>
+        <p>{analysis.correctionGuidance.summary}</p>
+        <ol>{analysis.correctionGuidance.steps.map((step, index) => <li key={`${step}-${index}`}>{step}</li>)}</ol>
+        {analysis.correctionGuidance.caution && (
+          <p className="spf-caution"><AlertTriangle aria-hidden="true" /> {analysis.correctionGuidance.caution}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
-  const [lookupType, setLookupType] = useState<DnsLookupType>("A");
+  const [lookupType, setLookupType] = useState<DnsLookupMode>("A");
   const [lookupInput, setLookupInput] = useState("");
   const [hasEditedInput, setHasEditedInput] = useState(false);
-  const [lookupResult, setLookupResult] = useState<DnsLookupResult | null>(null);
+  const [lookupResult, setLookupResult] = useState<DnsLookupResult<DnsLookupMode> | null>(null);
   const [lookupError, setLookupError] = useState<string | null>(null);
   const [lookupLoading, setLookupLoading] = useState(false);
   const [copiedRecord, setCopiedRecord] = useState<string | null>(null);
@@ -950,7 +1096,7 @@ export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: stri
     lookupControllerRef.current?.abort();
   }, []);
 
-  function handleLookupTypeChange(nextType: DnsLookupType) {
+  function handleLookupTypeChange(nextType: DnsLookupMode) {
     lookupRequestVersionRef.current += 1;
     lookupControllerRef.current?.abort();
     lookupControllerRef.current = null;
@@ -1074,12 +1220,12 @@ export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: stri
       <div className="container">
         <div className="dns-explorer-heading">
           <div>
-            <div className="eyebrow"><span /> DNS record explorer</div>
-            <h2 id="dns-explorer-title">Inspect the record behind the result.</h2>
+            <div className="eyebrow"><span /> DNS and SPF explorer</div>
+            <h2 id="dns-explorer-title">Inspect a record or analyze the bounded SPF path.</h2>
           </div>
           <p>
-            Query a specific public DNS owner and inspect the raw answer. This is a record lookup,
-            separate from the domain readiness score above.
+            Query a specific public DNS owner or select SPF for a recursive policy analysis with
+            correction steps. These results remain separate from the domain readiness score above.
           </p>
         </div>
 
@@ -1090,16 +1236,21 @@ export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: stri
               <select
                 id="dns-lookup-type"
                 value={lookupType}
-                onChange={(event) => handleLookupTypeChange(event.target.value as DnsLookupType)}
+                onChange={(event) => handleLookupTypeChange(event.target.value as DnsLookupMode)}
                 disabled={lookupLoading}
               >
+                <optgroup label="Email policy analysis">
+                  <option value="SPF">SPF analyzer</option>
+                </optgroup>
                 <optgroup label="DNS record types">
                   {DNS_LOOKUP_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
                 </optgroup>
               </select>
             </div>
             <div className="dns-lookup-field">
-              <label htmlFor="dns-lookup-name">{lookupType === "PTR" ? "IP address" : "DNS owner name"}</label>
+              <label htmlFor="dns-lookup-name">
+                {lookupType === "PTR" ? "IP address" : lookupType === "SPF" ? "SPF domain or owner" : "DNS owner name"}
+              </label>
               <div className="dns-name-input">
                 <Globe2 aria-hidden="true" />
                 <input
@@ -1129,7 +1280,7 @@ export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: stri
             </div>
             <button className="button button-primary dns-lookup-button" type="submit" disabled={lookupLoading || !lookupInput.trim()}>
               {lookupLoading ? <LoaderCircle className="spin" aria-hidden="true" /> : <FileSearch aria-hidden="true" />}
-              {lookupLoading ? "Looking up" : "Look up record"}
+              {lookupLoading ? (lookupType === "SPF" ? "Analyzing" : "Looking up") : (lookupType === "SPF" ? "Analyze SPF" : "Look up record")}
             </button>
           </form>
 
@@ -1158,7 +1309,10 @@ export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: stri
           {lookupLoading && (
             <div className="dns-lookup-loading" role="status" aria-live="polite">
               <LoaderCircle className="spin" aria-hidden="true" />
-              <div><strong>Resolving {lookupInput}</strong><span>Querying the selected public DNS record type.</span></div>
+              <div>
+                <strong>{lookupType === "SPF" ? `Analyzing SPF for ${lookupInput}` : `Resolving ${lookupInput}`}</strong>
+                <span>{lookupType === "SPF" ? "Following bounded include and redirect paths through public TXT records." : "Querying the selected public DNS record type."}</span>
+              </div>
             </div>
           )}
 
@@ -1191,8 +1345,12 @@ export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: stri
                 <div className="dns-empty-state" role="status">
                   <CircleHelp aria-hidden="true" />
                   <div>
-                    <strong>No records were returned for this name and type.</strong>
-                    <span>An empty answer is not automatically a fault. The record may be optional, published at a different owner name, or intentionally absent.</span>
+                    <strong>{lookupResult.type === "SPF" ? "No SPF policy was found in this domain's TXT records." : "No records were returned for this name and type."}</strong>
+                    <span>
+                      {lookupResult.type === "SPF"
+                        ? "Do not publish a guessed record. First inventory every legitimate service that uses this domain in its envelope-from address."
+                        : "An empty answer is not automatically a fault. The record may be optional, published at a different owner name, or intentionally absent."}
+                    </span>
                   </div>
                 </div>
               ) : (
@@ -1224,10 +1382,13 @@ export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: stri
                   )}
                 </div>
               )}
+              {lookupResult.type === "SPF" && lookupResult.spfAnalysis && (
+                <SpfAnalysisPanel analysis={lookupResult.spfAnalysis} />
+              )}
               <div className="dns-result-guidance">
                 <Info aria-hidden="true" />
                 <div>
-                  <strong>{records.length > 0 ? "How to validate this answer" : "What to check before changing DNS"}</strong>
+                  <strong>{lookupResult.type === "SPF" ? "SPF safety note" : records.length > 0 ? "How to validate this answer" : "What to check before changing DNS"}</strong>
                   <span>{records.length > 0 ? DNS_LOOKUP_GUIDANCE[lookupResult.type].present : DNS_LOOKUP_GUIDANCE[lookupResult.type].empty}</span>
                 </div>
               </div>
@@ -1238,8 +1399,9 @@ export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: stri
         <div className="dns-lookup-scope" id="dns-lookup-scope">
           <Info aria-hidden="true" />
           <p>
-            This explorer performs point-in-time public DNS record lookups only. It does not test SMTP,
-            blocklists, worldwide propagation, port reachability, or other network services.
+            This explorer performs point-in-time public DNS lookups and bounded SPF expansion only. It does not test SMTP,
+            blocklists, worldwide propagation, port reachability, or other network services. SPF analysis is not a simulation
+            for a particular sender IP and cannot replace real authentication results.
           </p>
         </div>
       </div>
@@ -1463,6 +1625,8 @@ export default function App() {
           />
         )}
         <AdvancedDnsExplorer suggestedDomain={result?.domain ?? ""} />
+        <DnsSurfaceScanner suggestedDomain={result?.domain ?? ""} />
+        <IpNetworkTool />
         <HowItWorks />
         <Methodology />
         <Roadmap />

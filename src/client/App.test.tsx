@@ -3,8 +3,14 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { CheckResult, DnsLookupResult, DnsLookupType, ScanResult } from "../shared/types";
-import { AdvancedDnsExplorer, DNS_LOOKUP_TYPES, isDnsLookupResult, isScanResult } from "./App";
+import type {
+  CheckResult,
+  DnsLookupResult,
+  DnsLookupType,
+  ScanResult,
+  SpfLookupAnalysis,
+} from "../shared/types";
+import { AdvancedDnsExplorer, DNS_LOOKUP_MODES, DNS_LOOKUP_TYPES, isDnsLookupResult, isScanResult } from "./App";
 
 function lookupResult(type: DnsLookupType = "A", overrides: Partial<DnsLookupResult> = {}): DnsLookupResult {
   return {
@@ -15,6 +21,51 @@ function lookupResult(type: DnsLookupType = "A", overrides: Partial<DnsLookupRes
     durationMs: 12,
     summary: `One ${type} record returned.`,
     records: [{ name: "example.com", type, value: "192.0.2.25", ttl: 300 }],
+    ...overrides,
+  };
+}
+
+function validSpfAnalysis(overrides: Partial<SpfLookupAnalysis> = {}): SpfLookupAnalysis {
+  return {
+    status: "valid",
+    recordCount: 1,
+    valid: true,
+    syntaxValid: true,
+    mechanisms: [
+      { raw: "include:_spf.example.net", qualifier: "+", name: "include", domainSpec: "_spf.example.net", causesDnsLookup: true },
+      { raw: "-all", qualifier: "-", name: "all", causesDnsLookup: false },
+    ],
+    terminalPolicy: "-all",
+    lookupEstimate: {
+      count: 3,
+      exceedsLimit: false,
+      truncated: false,
+      expandedDomains: ["_spf.example.net"],
+      issues: [],
+    },
+    warnings: [],
+    errors: [],
+    issues: [],
+    correctionGuidance: {
+      summary: "Keep the single SPF policy current.",
+      steps: ["Confirm every mechanism maps to an authorized sender.", "Rescan after provider changes."],
+    },
+    ...overrides,
+  };
+}
+
+function spfLookupResult(
+  overrides: Partial<DnsLookupResult<"SPF">> = {},
+): DnsLookupResult<"SPF"> {
+  return {
+    input: "example.com",
+    queryName: "example.com",
+    type: "SPF",
+    scannedAt: "2026-08-11T20:00:00.000Z",
+    durationMs: 18,
+    summary: "One valid SPF policy was found for example.com; the recursive lookup estimate is 3.",
+    records: [{ name: "example.com", type: "TXT", value: "v=spf1 include:_spf.example.net -all", ttl: 300 }],
+    spfAnalysis: validSpfAnalysis(),
     ...overrides,
   };
 }
@@ -39,6 +90,22 @@ describe("DNS lookup response validation", () => {
 
   it("rejects a response for a different request type", () => {
     expect(isDnsLookupResult(lookupResult("AAAA"), "A")).toBe(false);
+  });
+
+  it("accepts a truthful SPF analysis backed by TXT evidence", () => {
+    expect(DNS_LOOKUP_MODES).toContain("SPF");
+    expect(isDnsLookupResult(spfLookupResult(), "SPF")).toBe(true);
+  });
+
+  it.each([
+    { ...spfLookupResult(), spfAnalysis: undefined },
+    { ...spfLookupResult(), records: [{ name: "example.com", type: "SPF", value: "v=spf1 -all" }] },
+    { ...spfLookupResult(), spfAnalysis: { ...validSpfAnalysis(), recordCount: 257 } },
+    { ...spfLookupResult(), spfAnalysis: { ...validSpfAnalysis(), terminalPolicy: "hardfail" } },
+    { ...spfLookupResult(), spfAnalysis: { ...validSpfAnalysis(), lookupEstimate: { count: -1 } } },
+    { ...lookupResult(), spfAnalysis: validSpfAnalysis() },
+  ])("rejects malformed or misplaced SPF analysis data", (value) => {
+    expect(isDnsLookupResult(value, value.type === "SPF" ? "SPF" : "A")).toBe(false);
   });
 
   it.each([
@@ -94,6 +161,58 @@ describe("DNS record explorer interactions", () => {
 
     await user.selectOptions(screen.getByLabelText("Record type"), "PTR");
     expect((screen.getByLabelText("IP address") as HTMLInputElement).value).toBe("");
+  });
+
+  it("offers first-class SPF analysis and renders lookup evidence with correction steps", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(spfLookupResult()));
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    render(<AdvancedDnsExplorer suggestedDomain="example.com" />);
+
+    await user.selectOptions(screen.getByLabelText("Record type"), "SPF");
+    expect((screen.getByLabelText("SPF domain or owner") as HTMLInputElement).value).toBe("example.com");
+    await user.click(screen.getByRole("button", { name: "Analyze SPF" }));
+
+    await screen.findByText("SPF policy analysis");
+    expect(screen.getByText("3 / 10").textContent).toBe("3 / 10");
+    expect(screen.getByText("include:_spf.example.net").textContent).toBe("include:_spf.example.net");
+    expect(screen.getByText("How to correct or maintain it").textContent).toBe("How to correct or maintain it");
+    expect(screen.getByText("Confirm every mechanism maps to an authorized sender.").textContent).toMatch(/authorized sender/u);
+    const [url, request] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/lookup");
+    expect(JSON.parse(String(request.body))).toEqual({ name: "example.com", type: "SPF" });
+  });
+
+  it("shows missing-SPF guidance without inventing a replacement record", async () => {
+    const analysis = validSpfAnalysis({
+      status: "missing",
+      recordCount: 0,
+      valid: false,
+      syntaxValid: false,
+      mechanisms: [],
+      terminalPolicy: "none",
+      lookupEstimate: undefined,
+      issues: ["No v=spf1 policy was found in the TXT records at this domain."],
+      correctionGuidance: {
+        summary: "Inventory outbound senders before publishing one SPF TXT policy.",
+        steps: ["List every legitimate sender."],
+        caution: "Do not publish a generic SPF value.",
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(spfLookupResult({
+      summary: "No SPF policy was found in the TXT records for example.com.",
+      records: [],
+      spfAnalysis: analysis,
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    render(<AdvancedDnsExplorer suggestedDomain="example.com" />);
+
+    await user.selectOptions(screen.getByLabelText("Record type"), "SPF");
+    await user.click(screen.getByRole("button", { name: "Analyze SPF" }));
+
+    await screen.findByText("No SPF policy was found in this domain's TXT records.");
+    expect(screen.getByText("Do not publish a generic SPF value.").textContent).toMatch(/generic SPF/u);
   });
 
   it("invalidates an old in-flight answer when a newly scanned domain replaces it", async () => {

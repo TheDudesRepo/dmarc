@@ -22,7 +22,7 @@ describe("Worker API boundary", () => {
     const body = (await response.json()) as { status: string; version: string; deploymentId: string | null };
 
     expect(response.status).toBe(200);
-    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.2.3", deploymentId: null }));
+    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.3.0", deploymentId: null }));
     expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.headers.get("cache-control")).toContain("no-store");
@@ -192,6 +192,67 @@ describe("Worker API boundary", () => {
     expect(body.summary).toBe("No TXT records were returned for _dmarc.example.com.");
   });
 
+  it("exposes analyzed SPF through the lookup route while returning only SPF TXT evidence", async () => {
+    const resolveTxt = vi.spyOn(dns.promises, "resolveTxt").mockResolvedValue([
+      ["verification=not-spf"],
+      ["v=spf1", " include:mail.example.net", " -all"],
+    ]);
+    resolveTxt.mockImplementation(async (name) => (
+      name === "mail.example.net"
+        ? [["v=spf1 ip4:192.0.2.0/24 -all"]]
+        : [
+            ["verification=not-spf"],
+            ["v=spf1", " include:mail.example.net", " -all"],
+          ]
+    ));
+
+    const response = await lookupRequest(JSON.stringify({ name: "Example.COM.", type: "SPF" }));
+    const body = (await response.json()) as {
+      type: string;
+      queryName: string;
+      records: Array<{ name: string; type: string; value: string }>;
+      spfAnalysis: {
+        status: string;
+        valid: boolean;
+        syntaxValid: boolean;
+        terminalPolicy: string;
+        lookupEstimate: { count: number; expandedDomains: string[] };
+        correctionGuidance: { steps: string[] };
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.type).toBe("SPF");
+    expect(body.queryName).toBe("example.com");
+    expect(body.records).toEqual([
+      { name: "example.com", type: "TXT", value: "v=spf1 include:mail.example.net -all" },
+    ]);
+    expect(body.spfAnalysis).toEqual(expect.objectContaining({
+      status: "valid",
+      valid: true,
+      syntaxValid: true,
+      terminalPolicy: "-all",
+      lookupEstimate: expect.objectContaining({
+        count: 1,
+        expandedDomains: ["mail.example.net"],
+      }),
+    }));
+    expect(body.spfAnalysis.correctionGuidance.steps.length).toBeGreaterThan(0);
+    expect(resolveTxt).toHaveBeenCalledWith("example.com");
+    expect(resolveTxt).toHaveBeenCalledWith("mail.example.net");
+  });
+
+  it("analyzes an underscore-prefixed public SPF policy owner", async () => {
+    const resolveTxt = vi.spyOn(dns.promises, "resolveTxt").mockResolvedValue([["v=spf1 -all"]]);
+    const response = await lookupRequest(JSON.stringify({ name: "_spf.example.com", type: "SPF" }));
+    const body = (await response.json()) as { queryName: string; spfAnalysis: { status: string } };
+
+    expect(response.status).toBe(200);
+    expect(body.queryName).toBe("_spf.example.com");
+    expect(body.spfAnalysis.status).toBe("valid");
+    expect(resolveTxt).toHaveBeenCalledWith("_spf.example.com");
+  });
+
   it("maps resolver failures to a hardened 502 response", async () => {
     const refusal = Object.assign(new Error("query refused"), { code: "EREFUSED" });
     vi.spyOn(dns.promises, "resolve4").mockRejectedValue(refusal);
@@ -200,6 +261,397 @@ describe("Worker API boundary", () => {
     expect(response.status).toBe(502);
     expect(response.headers.get("cache-control")).toContain("no-store");
     await expect(response.json()).resolves.toEqual(expect.objectContaining({ code: "UPSTREAM_ERROR" }));
+  });
+
+  it("maps a failed root SPF TXT query to the same hardened upstream boundary", async () => {
+    const refusal = Object.assign(new Error("query refused"), { code: "EREFUSED" });
+    vi.spyOn(dns.promises, "resolveTxt").mockRejectedValue(refusal);
+    const response = await lookupRequest(JSON.stringify({ name: "example.com", type: "SPF" }));
+
+    expect(response.status).toBe(502);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({ code: "UPSTREAM_ERROR" }));
+  });
+
+  it.each(["/api/dns-snapshot", "/api/host-discovery", "/api/ip-network"])(
+    "allows only POST for %s",
+    async (path) => {
+      const getResponse = await worker.fetch(new Request(`https://scanner.example${path}`), env);
+      const optionsResponse = await worker.fetch(
+        new Request(`https://scanner.example${path}`, { method: "OPTIONS" }),
+        env,
+      );
+
+      expect(getResponse.status).toBe(405);
+      expect(getResponse.headers.get("allow")).toBe("POST");
+      expect(optionsResponse.status).toBe(405);
+      expect(optionsResponse.headers.get("allow")).toBe("POST");
+    },
+  );
+
+  it("enforces the shared JSON boundary for DNS snapshots", async () => {
+    const resolve4 = vi.spyOn(dns.promises, "resolve4");
+    const wrongContentType = await apiRequest("/api/dns-snapshot", "{}");
+    const malformed = await apiRequest("/api/dns-snapshot", "not-json", { "content-type": "application/json" });
+    const primitive = await apiRequest("/api/dns-snapshot", "[]", { "content-type": "application/json" });
+    const missingDomain = await apiRequest(
+      "/api/dns-snapshot",
+      JSON.stringify({}),
+      { "content-type": "application/json" },
+    );
+    const oversizedBody = await apiRequest(
+      "/api/dns-snapshot",
+      JSON.stringify({ domain: `${"a".repeat(2_100)}.com` }),
+      { "content-type": "application/json" },
+    );
+
+    expect(wrongContentType.status).toBe(400);
+    expect(malformed.status).toBe(400);
+    expect(primitive.status).toBe(400);
+    expect(missingDomain.status).toBe(400);
+    expect(oversizedBody.status).toBe(413);
+    expect(resolve4).not.toHaveBeenCalled();
+    await expect(missingDomain.json()).resolves.toEqual(expect.objectContaining({ code: "BAD_REQUEST" }));
+    await expect(oversizedBody.json()).resolves.toEqual(expect.objectContaining({ code: "BAD_REQUEST" }));
+  });
+
+  it("enforces the shared JSON boundary for host discovery", async () => {
+    const resolve4 = vi.spyOn(dns.promises, "resolve4");
+    const wrongContentType = await apiRequest("/api/host-discovery", "{}");
+    const malformed = await apiRequest("/api/host-discovery", "not-json", { "content-type": "application/json" });
+    const missingProfile = await apiRequest(
+      "/api/host-discovery",
+      JSON.stringify({ domain: "example.com" }),
+      { "content-type": "application/json" },
+    );
+    const oversizedDeclared = await apiRequest(
+      "/api/host-discovery",
+      JSON.stringify({ domain: "example.com", profile: "core" }),
+      { "content-type": "application/json", "content-length": "2049" },
+    );
+
+    expect(wrongContentType.status).toBe(400);
+    expect(malformed.status).toBe(400);
+    expect(missingProfile.status).toBe(400);
+    expect(oversizedDeclared.status).toBe(413);
+    expect(resolve4).not.toHaveBeenCalled();
+    await expect(missingProfile.json()).resolves.toEqual(expect.objectContaining({ code: "BAD_REQUEST" }));
+    await expect(oversizedDeclared.json()).resolves.toEqual(expect.objectContaining({ code: "BAD_REQUEST" }));
+  });
+
+  it("enforces the shared JSON boundary for IP and subnet tools", async () => {
+    const resolve4 = vi.spyOn(dns.promises, "resolve4");
+    const wrongContentType = await apiRequest("/api/ip-network", "{}");
+    const malformed = await apiRequest("/api/ip-network", "not-json", { "content-type": "application/json" });
+    const missingInput = await endpointJson("/api/ip-network", {});
+    const oversizedBody = await endpointJson("/api/ip-network", { input: "1".repeat(2_100) });
+
+    expect(wrongContentType.status).toBe(400);
+    expect(malformed.status).toBe(400);
+    expect(missingInput.status).toBe(400);
+    expect(oversizedBody.status).toBe(413);
+    expect(resolve4).not.toHaveBeenCalled();
+    await expect(missingInput.json()).resolves.toEqual(expect.objectContaining({ code: "BAD_REQUEST" }));
+  });
+
+  it("calculates a subnet without making DNS enrichment queries", async () => {
+    const resolveCname = vi.mocked(dns.promises.resolveCname);
+    const resolvePtr = vi.spyOn(dns.promises, "resolvePtr");
+    const resolveTxt = vi.spyOn(dns.promises, "resolveTxt");
+
+    const response = await endpointJson("/api/ip-network", { input: "192.168.7.42/255.255.255.0" });
+    const body = (await response.json()) as {
+      canonical: string;
+      networkCidr: string;
+      totalAddresses: string;
+      classification: { kind: string };
+      ipv4: { netmask: string; wildcard: string; broadcast: string };
+      enrichment: { status: string; queryCount: number };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual(expect.objectContaining({
+      canonical: "192.168.7.42/24",
+      networkCidr: "192.168.7.0/24",
+      totalAddresses: "256",
+      classification: expect.objectContaining({ kind: "private" }),
+      ipv4: {
+        netmask: "255.255.255.0",
+        wildcard: "0.0.0.255",
+        broadcast: "192.168.7.255",
+      },
+      enrichment: expect.objectContaining({ status: "not-applicable", queryCount: 0 }),
+    }));
+    expect(resolveCname).not.toHaveBeenCalled();
+    expect(resolvePtr).not.toHaveBeenCalled();
+    expect(resolveTxt).not.toHaveBeenCalled();
+  });
+
+  it("adds bounded PTR and Team Cymru evidence for one global address", async () => {
+    const ptrOwner = "4.4.8.8.in-addr.arpa";
+    const originOwner = "4.4.8.8.origin.asn.cymru.com";
+    vi.spyOn(dns.promises, "resolvePtr").mockImplementation(async (name) => (
+      name === ptrOwner ? ["dns.google."] : []
+    ));
+    vi.spyOn(dns.promises, "resolveTxt").mockImplementation(async (name) => {
+      if (name === originOwner) return [["15169 | 8.8.4.0/24 | US | arin | 1992-12-01"]];
+      if (name === "as15169.asn.cymru.com") {
+        return [["15169 | US | arin | 2000-03-30 | GOOGLE, US"]];
+      }
+      return [];
+    });
+
+    const response = await endpointJson("/api/ip-network", { input: "8.8.4.4" });
+    const body = (await response.json()) as {
+      canonical: string;
+      classification: { kind: string };
+      enrichment: {
+        status: string;
+        queryCount: number;
+        ptr: { status: string; names: string[] };
+        origin: { status: string; record: { asn: string; prefix: string } };
+        asName: { status: string; name: string };
+      };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.canonical).toBe("8.8.4.4/32");
+    expect(body.classification.kind).toBe("global");
+    expect(body.enrichment).toEqual(expect.objectContaining({
+      status: "complete",
+      queryCount: 3,
+      ptr: expect.objectContaining({ status: "found", names: ["dns.google"] }),
+      origin: expect.objectContaining({
+        status: "found",
+        record: expect.objectContaining({ asn: "15169", prefix: "8.8.4.0/24" }),
+      }),
+      asName: expect.objectContaining({ status: "found", name: "GOOGLE, US" }),
+    }));
+  });
+
+  it.each([
+    "example.com",
+    "https://127.0.0.1/admin",
+    "192.0.2.1-192.0.2.20",
+    "2001:db8::1%eth0",
+  ])("rejects unsafe IP-tool input before DNS resolution: %s", async (input) => {
+    const resolvePtr = vi.spyOn(dns.promises, "resolvePtr");
+    const resolveTxt = vi.spyOn(dns.promises, "resolveTxt");
+    const response = await endpointJson("/api/ip-network", { input });
+
+    expect(response.status).toBe(400);
+    expect(resolvePtr).not.toHaveBeenCalled();
+    expect(resolveTxt).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({ code: "BAD_REQUEST" }));
+  });
+
+  it("rejects unsafe discovery domains and undocumented profiles before resolving", async () => {
+    const resolve4 = vi.spyOn(dns.promises, "resolve4");
+    const unsafeSnapshot = await endpointJson("/api/dns-snapshot", { domain: "https://127.0.0.1/admin" });
+    const unsafeDiscovery = await endpointJson("/api/host-discovery", {
+      domain: "localhost",
+      profile: "core",
+    });
+    const invalidProfile = await endpointJson("/api/host-discovery", {
+      domain: "example.com",
+      profile: "all",
+    });
+    const nonStringProfile = await endpointJson("/api/host-discovery", {
+      domain: "example.com",
+      profile: 1,
+    });
+
+    expect(unsafeSnapshot.status).toBe(400);
+    expect(unsafeDiscovery.status).toBe(400);
+    expect(invalidProfile.status).toBe(400);
+    expect(nonStringProfile.status).toBe(400);
+    expect(resolve4).not.toHaveBeenCalled();
+    await expect(unsafeSnapshot.json()).resolves.toEqual(expect.objectContaining({ code: "INVALID_DOMAIN" }));
+    await expect(unsafeDiscovery.json()).resolves.toEqual(expect.objectContaining({ code: "INVALID_DOMAIN" }));
+    await expect(invalidProfile.json()).resolves.toEqual({
+      error: "Profile must be core or extended.",
+      code: "BAD_REQUEST",
+    });
+  });
+
+  it("returns a complete explicit DNS snapshot through the hardened API boundary", async () => {
+    const mocks = mockEmptyDiscoveryDns();
+    mocks.resolve4.mockImplementation(async (name) => {
+      if (name === "example.com") return [{ address: "192.0.2.10", ttl: 300 }];
+      if (name === "mail.example.com") return [{ address: "192.0.2.25", ttl: 300 }];
+      if (name === "ns1.example.net") return [{ address: "192.0.2.53", ttl: 300 }];
+      return [];
+    });
+    mocks.resolveCaa.mockResolvedValue([{ critical: 0, issue: "letsencrypt.org" }]);
+    mocks.resolveMx.mockResolvedValue([{ priority: 10, exchange: "mail.example.com." }]);
+    mocks.resolveNs.mockResolvedValue(["ns1.example.net."]);
+    mocks.resolveSoa.mockResolvedValue({
+      nsname: "ns1.example.net.",
+      hostmaster: "hostmaster.example.net.",
+      serial: 2026081101,
+      refresh: 3600,
+      retry: 600,
+      expire: 1_209_600,
+      minttl: 300,
+    });
+    mocks.resolveTxt.mockImplementation(async (name) => {
+      if (name === "example.com") return [["v=spf1 -all"]];
+      if (name === "_dmarc.example.com") return [["v=DMARC1; p=quarantine"]];
+      if (name === "_mta-sts.example.com") return [["v=STSv1; id=20260811"]];
+      if (name === "_smtp._tls.example.com") return [["v=TLSRPTv1; rua=mailto:tls@example.com"]];
+      return [];
+    });
+
+    const response = await endpointJson("/api/dns-snapshot", { domain: "Example.COM." });
+    const body = (await response.json()) as {
+      domain: string;
+      groups: Array<{ type: string; status: string; records: Array<{ value: string }> }>;
+      securityRecords: Array<{ key: string; status: string }>;
+      infrastructureHosts: Array<{ hostname: string; addresses: string[] }>;
+      recordCount: number;
+    };
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(body.domain).toBe("example.com");
+    expect(body.groups).toHaveLength(8);
+    expect(body.groups.find((group) => group.type === "A")).toEqual(expect.objectContaining({
+      status: "found",
+      records: [expect.objectContaining({ value: "192.0.2.10" })],
+    }));
+    expect(body.securityRecords.find((record) => record.key === "dmarc")?.status).toBe("found");
+    expect(body.infrastructureHosts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ hostname: "mail.example.com", addresses: ["192.0.2.25"] }),
+      expect.objectContaining({ hostname: "ns1.example.net", addresses: ["192.0.2.53"] }),
+    ]));
+    expect(body.recordCount).toBeGreaterThan(0);
+  });
+
+  it("keeps partial DNS snapshot failures in a successful structured response", async () => {
+    const mocks = mockEmptyDiscoveryDns();
+    const secret = Object.assign(new Error("resolver-secret-caa"), { code: "EREFUSED" });
+    mocks.resolveCaa.mockRejectedValue(secret);
+    mocks.resolveSoa.mockResolvedValue({
+      nsname: "ns1.example.net",
+      hostmaster: "hostmaster.example.net",
+      serial: 1,
+      refresh: 3600,
+      retry: 600,
+      expire: 1_209_600,
+      minttl: 300,
+    });
+    mocks.resolveTxt.mockImplementation(async (name) => {
+      if (name === "_dmarc.example.com") throw Object.assign(new Error("resolver-secret-dmarc"), { code: "EREFUSED" });
+      return [];
+    });
+
+    const response = await endpointJson("/api/dns-snapshot", { domain: "example.com" });
+    const text = await response.text();
+    const body = JSON.parse(text) as {
+      groups: Array<{ type: string; status: string }>;
+      securityRecords: Array<{ key: string; status: string }>;
+      unavailableCount: number;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.groups.find((group) => group.type === "CAA")?.status).toBe("unavailable");
+    expect(body.securityRecords.find((record) => record.key === "dmarc")?.status).toBe("unavailable");
+    expect(body.unavailableCount).toBe(2);
+    expect(text).not.toContain("resolver-secret");
+    expect(text).not.toContain("EREFUSED");
+  });
+
+  it("maps total apex snapshot failure to a sanitized 502 without leaking resolver details", async () => {
+    mockEmptyDiscoveryDns();
+    const secret = Object.assign(new Error("resolver-secret-token"), { code: "EREFUSED" });
+    vi.mocked(dns.promises.resolveCname).mockImplementation(async (name) => {
+      if (name === "example.com") throw secret;
+      return [];
+    });
+
+    const response = await endpointJson("/api/dns-snapshot", { domain: "example.com" });
+    const text = await response.text();
+
+    expect(response.status).toBe(502);
+    expect(JSON.parse(text)).toEqual({
+      error: "DNS data is temporarily unavailable. Please try again.",
+      code: "UPSTREAM_ERROR",
+    });
+    expect(text).not.toContain("resolver-secret-token");
+    expect(text).not.toContain("EREFUSED");
+  });
+
+  it.each([
+    { profile: "core", label: "www" },
+    { profile: "extended", label: "status" },
+  ])("returns bounded $profile host discovery results", async ({ profile, label }) => {
+    const mocks = mockEmptyDiscoveryDns();
+    mocks.resolve4.mockImplementation(async (name) => (
+      name === `${label}.example.com` ? [{ address: "192.0.2.44", ttl: 300 }] : []
+    ));
+
+    const response = await endpointJson("/api/host-discovery", { domain: "Example.COM.", profile });
+    const body = (await response.json()) as {
+      domain: string;
+      profile: string;
+      testedNames: string[];
+      hosts: Array<{ hostname: string; profile: string; addresses: string[]; reverseNames: string[] }>;
+      unavailableNames: string[];
+      wildcardProbe: { hostname: string; detected: boolean; addresses: string[]; unavailable: boolean };
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.domain).toBe("example.com");
+    expect(body.profile).toBe(profile);
+    expect(body.testedNames).toHaveLength(7);
+    expect(body.hosts).toEqual([
+      expect.objectContaining({
+        hostname: `${label}.example.com`,
+        profile,
+        addresses: ["192.0.2.44"],
+        reverseNames: [],
+      }),
+    ]);
+    expect(body.unavailableNames).toEqual([]);
+    expect(body.wildcardProbe.hostname).toMatch(/^dmarc-ready-probe-[a-f0-9]{16}\.example\.com$/u);
+    expect(body.wildcardProbe.detected).toBe(false);
+    expect(mocks.resolvePtr).not.toHaveBeenCalled();
+  });
+
+  it("reports partial and total common-host resolver failures without inferring absence or leaking errors", async () => {
+    const partialMocks = mockEmptyDiscoveryDns();
+    partialMocks.resolve4.mockImplementation(async (name) => {
+      if (name === "api.example.com") {
+        throw Object.assign(new Error("partial-secret"), { code: "EREFUSED" });
+      }
+      return [];
+    });
+
+    const partial = await endpointJson("/api/host-discovery", { domain: "example.com", profile: "core" });
+    const partialText = await partial.text();
+    const partialBody = JSON.parse(partialText) as { unavailableNames: string[]; hosts: unknown[] };
+    expect(partial.status).toBe(200);
+    expect(partialBody.unavailableNames).toContain("api.example.com");
+    expect(partialBody.hosts).toEqual([]);
+    expect(partialText).not.toContain("partial-secret");
+
+    vi.restoreAllMocks();
+    vi.spyOn(dns.promises, "resolveCname").mockRejectedValue(
+      Object.assign(new Error("total-secret"), { code: "EREFUSED" }),
+    );
+    vi.spyOn(dns.promises, "resolve4").mockResolvedValue([]);
+    vi.spyOn(dns.promises, "resolve6").mockResolvedValue([]);
+    vi.spyOn(dns.promises, "resolvePtr").mockResolvedValue([]);
+
+    const total = await endpointJson("/api/host-discovery", { domain: "example.com", profile: "core" });
+    const totalText = await total.text();
+    const totalBody = JSON.parse(totalText) as { unavailableNames: string[]; hosts: unknown[] };
+    expect(total.status).toBe(200);
+    expect(totalBody.unavailableNames).toHaveLength(7);
+    expect(totalBody.hosts).toEqual([]);
+    expect(totalText).not.toContain("total-secret");
+    expect(totalText).not.toContain("EREFUSED");
   });
 });
 
@@ -212,4 +664,47 @@ function lookupRequest(body: string): Promise<Response> {
     }),
     env,
   );
+}
+
+function endpointJson(path: string, body: unknown): Promise<Response> {
+  return apiRequest(path, JSON.stringify(body), { "content-type": "application/json" });
+}
+
+function apiRequest(path: string, body: string, headers: Record<string, string> = {}): Promise<Response> {
+  return worker.fetch(
+    new Request(`https://scanner.example${path}`, {
+      method: "POST",
+      headers,
+      body,
+    }),
+    env,
+  );
+}
+
+function mockEmptyDiscoveryDns() {
+  const resolveCname = vi.mocked(dns.promises.resolveCname);
+  resolveCname.mockResolvedValue([]);
+  const resolve4 = vi.spyOn(dns.promises, "resolve4").mockResolvedValue([]);
+  const resolve6 = vi.spyOn(dns.promises, "resolve6").mockResolvedValue([]);
+  const resolveCaa = vi.spyOn(dns.promises, "resolveCaa").mockResolvedValue([]);
+  const resolveMx = vi.spyOn(dns.promises, "resolveMx").mockResolvedValue([]);
+  const resolveNs = vi.spyOn(dns.promises, "resolveNs").mockResolvedValue([]);
+  const resolveSoa = vi.spyOn(dns.promises, "resolveSoa").mockRejectedValue(dnsError("ENODATA"));
+  const resolveTxt = vi.spyOn(dns.promises, "resolveTxt").mockResolvedValue([]);
+  const resolvePtr = vi.spyOn(dns.promises, "resolvePtr").mockResolvedValue([]);
+  return {
+    resolve4,
+    resolve6,
+    resolveCaa,
+    resolveCname,
+    resolveMx,
+    resolveNs,
+    resolvePtr,
+    resolveSoa,
+    resolveTxt,
+  };
+}
+
+function dnsError(code: string): Error & { code: string } {
+  return Object.assign(new Error(code), { code });
 }

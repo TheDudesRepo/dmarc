@@ -31,11 +31,17 @@ export interface SpfLookupEstimate {
 
 export type SpfTxtResolver = (domain: string) => Promise<string[]>;
 
+export interface SpfLookupEstimateOptions {
+  timeoutMs?: number;
+}
+
 const LOOKUP_MECHANISMS = new Set(["include", "a", "mx", "ptr", "exists"]);
 const MAX_RECURSION_DEPTH = 12;
 // Keep operational headroom for alias following and transient retries after
 // the scanner's fixed DNS checks. Deeper paths are reported as lower bounds.
 const MAX_EXPANDED_RECORDS = 5;
+const DEFAULT_ESTIMATE_TIMEOUT_MS = 8_000;
+const ESTIMATE_DEADLINE = Symbol("SPF estimate deadline");
 
 export function findSpfRecords(txtRecords: string[]): string[] {
   return txtRecords.filter((record) => /^\s*v=spf1(?:\s|$)/iu.test(record));
@@ -62,7 +68,10 @@ export function parseSpfRecord(raw: string): ParsedSpfRecord {
       else modifiers[name] = value;
       if (name === "redirect" && !isPlausibleDomainSpec(value)) errors.push("redirect has an invalid domain-spec.");
       else if (name === "exp" && !isPlausibleDomainSpec(value)) errors.push("exp has an invalid domain-spec.");
-      else if (name !== "redirect" && name !== "exp") warnings.push(`Unknown ${name} modifier will normally be ignored by receivers.`);
+      else if (name !== "redirect" && name !== "exp") {
+        if (!validateMacroString(value, false).valid) errors.push(`Unknown ${name} modifier has invalid macro syntax.`);
+        warnings.push(`Unknown ${name} modifier will normally be ignored by receivers.`);
+      }
       continue;
     }
 
@@ -110,14 +119,32 @@ export async function estimateSpfLookups(
   domain: string,
   record: ParsedSpfRecord,
   resolveTxt: SpfTxtResolver,
+  options: SpfLookupEstimateOptions = {},
 ): Promise<SpfLookupEstimate> {
   let count = 0;
   let expandedRecordCount = 0;
   let truncated = false;
   const expandedDomains = new Set<string>();
   const issues = new Set<string>();
+  const requestedTimeout = options.timeoutMs ?? DEFAULT_ESTIMATE_TIMEOUT_MS;
+  const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+    ? Math.min(Math.floor(requestedTimeout), DEFAULT_ESTIMATE_TIMEOUT_MS)
+    : DEFAULT_ESTIMATE_TIMEOUT_MS;
+  const deadline = performance.now() + timeoutMs;
+
+  const markDeadline = (): void => {
+    truncated = true;
+    issues.add("SPF expansion stopped at the scanner's overall analysis deadline; the lookup count is a lower bound.");
+  };
+
+  const deadlineReached = (): boolean => {
+    if (performance.now() < deadline) return false;
+    markDeadline();
+    return true;
+  };
 
   const walk = async (currentDomain: string, current: ParsedSpfRecord, stack: string[], depth: number): Promise<void> => {
+    if (deadlineReached()) return;
     if (depth > MAX_RECURSION_DEPTH) {
       truncated = true;
       issues.add("SPF recursion depth exceeded the scanner safety limit.");
@@ -128,6 +155,7 @@ export async function estimateSpfLookups(
     const evaluated = current.mechanisms.slice(0, allIndex >= 0 ? allIndex : undefined);
 
     for (const mechanism of evaluated) {
+      if (deadlineReached()) return;
       if (!mechanism.causesDnsLookup) continue;
       count += 1;
 
@@ -156,6 +184,7 @@ export async function estimateSpfLookups(
   };
 
   const expandTarget = async (target: string, stack: string[], depth: number): Promise<void> => {
+    if (deadlineReached()) return;
     if (stack.includes(target)) {
       issues.add(`SPF include/redirect cycle detected at ${target}.`);
       return;
@@ -171,8 +200,12 @@ export async function estimateSpfLookups(
 
     let txtRecords: string[];
     try {
-      txtRecords = await resolveTxt(target);
-    } catch {
+      txtRecords = await resolveBeforeDeadline(target);
+    } catch (error) {
+      if (error === ESTIMATE_DEADLINE) {
+        markDeadline();
+        return;
+      }
       issues.add(`Could not resolve the included SPF record at ${target}.`);
       return;
     }
@@ -193,6 +226,21 @@ export async function estimateSpfLookups(
       return;
     }
     await walk(target, parsed, [...stack, target], depth + 1);
+  };
+
+  const resolveBeforeDeadline = async (target: string): Promise<string[]> => {
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) throw ESTIMATE_DEADLINE;
+
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timeoutHandle = setTimeout(() => reject(ESTIMATE_DEADLINE), remainingMs);
+    });
+    try {
+      return await Promise.race([resolveTxt(target), timeout]);
+    } finally {
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    }
   };
 
   await walk(domain, record, [domain], 0);
@@ -230,12 +278,12 @@ function parseMechanism(token: string): SpfMechanism | string {
     };
   }
 
-  const hostMatch = /^(a|mx)(?::([^/]+))?(?:\/(\d{1,2}))?(?:\/\/(\d{1,3}))?$/iu.exec(body);
-  if (hostMatch) {
-    const name = (hostMatch[1] ?? "").toLowerCase();
-    const domainSpec = hostMatch[2];
-    const cidr4 = hostMatch[3] === undefined ? undefined : Number(hostMatch[3]);
-    const cidr6 = hostMatch[4] === undefined ? undefined : Number(hostMatch[4]);
+  const hostNameMatch = /^(a|mx)(?=[:/]|$)/iu.exec(body);
+  if (hostNameMatch) {
+    const name = (hostNameMatch[1] ?? "").toLowerCase();
+    const parsedHost = parseHostMechanismBody(body, name);
+    if (typeof parsedHost === "string") return parsedHost;
+    const { domainSpec, cidr4, cidr6 } = parsedHost;
     if (domainSpec && !isPlausibleDomainSpec(domainSpec)) return `${name} has an invalid domain-spec.`;
     if (cidr4 !== undefined && cidr4 > 32) return `${name} has an IPv4 prefix longer than 32 bits.`;
     if (cidr6 !== undefined && cidr6 > 128) return `${name} has an IPv6 prefix longer than 128 bits.`;
@@ -291,20 +339,130 @@ function isQualifier(value: string | undefined): value is SpfQualifier {
 }
 
 function isPlausibleDomainSpec(value: string): boolean {
-  if (!value || value.length > 253 || /[\s/@?#]/u.test(value)) return false;
-  // SPF macros contain '%' and are evaluated by receivers. For static parsing,
-  // retain them while refusing characters that can alter a URL or query.
-  return /^[a-z0-9._%{}+\-=]+$/iu.test(value);
+  if (!value || value.length > 253 || /\s/u.test(value)) return false;
+  const macroState = validateMacroString(value, true);
+  if (!macroState.valid) return false;
+  // A receiver supplies the message- and connection-dependent values. Once
+  // the macro grammar is valid, keep the branch as statically incomplete.
+  if (macroState.hasMacro) {
+    if (macroState.endsWithMacro) return true;
+    const finalLabel = /\.([a-z0-9-]+)\.?$/iu.exec(value)?.[1];
+    return finalLabel !== undefined && isSpfTopLabel(finalLabel);
+  }
+  return normalizeStaticDomainSpec(value) !== undefined;
+}
+
+function validateMacroString(
+  value: string,
+  domainLiteralsOnly: boolean,
+): { valid: boolean; hasMacro: boolean; endsWithMacro: boolean } {
+  let hasMacro = false;
+  let endsWithMacro = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index] ?? "";
+    if (character !== "%") {
+      const validLiteral = domainLiteralsOnly
+        ? /[a-z0-9._-]/iu.test(character)
+        : /^[\x21-\x24\x26-\x7e]$/u.test(character);
+      if (!validLiteral) return { valid: false, hasMacro, endsWithMacro };
+      endsWithMacro = false;
+      continue;
+    }
+
+    hasMacro = true;
+    const next = value[index + 1];
+    if (next === "%" || next === "_" || next === "-") {
+      endsWithMacro = true;
+      index += 1;
+      continue;
+    }
+    if (next !== "{") return { valid: false, hasMacro, endsWithMacro };
+
+    const close = value.indexOf("}", index + 2);
+    if (close < 0) return { valid: false, hasMacro, endsWithMacro };
+    const expression = value.slice(index + 2, close);
+    const match = /^([slodiphv])(\d*)(r?)([.\-+,/_=]*)$/iu.exec(expression);
+    if (!match) return { valid: false, hasMacro, endsWithMacro };
+    const transformerDigits = match[2] ?? "";
+    if (transformerDigits && Number(transformerDigits) === 0) {
+      return { valid: false, hasMacro, endsWithMacro };
+    }
+    endsWithMacro = true;
+    index = close;
+  }
+  return { valid: true, hasMacro, endsWithMacro };
 }
 
 function normalizeLookupTarget(value: string | undefined): string | undefined {
   if (!value || value.includes("%{")) return undefined;
+  return normalizeStaticDomainSpec(value);
+}
+
+function normalizeStaticDomainSpec(value: string): string | undefined {
   const normalized = value.toLowerCase().replace(/\.$/u, "");
   if (!normalized || normalized.length > 253) return undefined;
   const labels = normalized.split(".");
   if (labels.length < 2) return undefined;
-  if (labels.some((label) => !label || label.length > 63 || !/^[a-z0-9_-]+$/u.test(label))) return undefined;
+  if (labels.some((label) => (
+    !label
+    || label.length > 63
+    || !/^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/iu.test(label)
+  ))) return undefined;
+  if (!isSpfTopLabel(labels.at(-1) ?? "")) return undefined;
   return normalized;
+}
+
+function isSpfTopLabel(label: string): boolean {
+  if (!label || label.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/iu.test(label)) return false;
+  return /[a-z]/iu.test(label) || label.includes("-");
+}
+
+function parseHostMechanismBody(
+  body: string,
+  name: string,
+): { domainSpec?: string; cidr4?: number; cidr6?: number } | string {
+  const tail = body.slice(name.length);
+  const slashIndexes: number[] = [];
+  let inMacro = false;
+  for (let index = 0; index < tail.length; index += 1) {
+    if (!inMacro && tail[index] === "%" && tail[index + 1] === "{") {
+      inMacro = true;
+      index += 1;
+      continue;
+    }
+    if (inMacro && tail[index] === "}") {
+      inMacro = false;
+      continue;
+    }
+    if (!inMacro && tail[index] === "/") slashIndexes.push(index);
+  }
+
+  let suffixStart = tail.length;
+  let suffixMatch: RegExpExecArray | null = null;
+  for (const index of slashIndexes) {
+    const candidate = tail.slice(index);
+    const match = /^(?:\/(\d{1,2}))?(?:\/\/(\d{1,3}))?$/u.exec(candidate);
+    if (match && candidate) {
+      suffixStart = index;
+      suffixMatch = match;
+      break;
+    }
+  }
+
+  const ownerPart = tail.slice(0, suffixStart);
+  if (slashIndexes.some((index) => index < suffixStart)) return `${name} has malformed CIDR syntax.`;
+  let domainSpec: string | undefined;
+  if (ownerPart) {
+    if (!ownerPart.startsWith(":") || ownerPart.length === 1) return `${name} has a malformed domain-spec.`;
+    domainSpec = ownerPart.slice(1);
+  }
+  const cidr4 = suffixMatch?.[1] === undefined ? undefined : Number(suffixMatch[1]);
+  const cidr6 = suffixMatch?.[2] === undefined ? undefined : Number(suffixMatch[2]);
+  return {
+    ...(domainSpec ? { domainSpec } : {}),
+    ...(cidr4 === undefined ? {} : { cidr4 }),
+    ...(cidr6 === undefined ? {} : { cidr6 }),
+  };
 }
 
 function isIpv4(value: string): boolean {

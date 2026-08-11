@@ -5,43 +5,116 @@
 DMARC Ready deploys as one Cloudflare Worker containing two layers:
 
 1. A Vite-built React single-page application served through Workers Static Assets.
-2. A Worker API that handles `/api/*`, validates domain input, performs bounded native DNS queries, and returns structured JSON.
+2. A Worker API that validates bounded DNS requests, uses the platform's fixed native resolver, and returns structured JSON.
 
 ```mermaid
-flowchart LR
-    U[Browser] -->|POST /api/scan| W[Cloudflare Worker]
-    W --> V[Input validation]
-    V --> S[Scanner engine]
-    S -->|Bounded native queries| D[Cloudflare DNS at 1.1.1.1]
-    S --> P[Deterministic parsers]
-    P --> A[Findings and score]
-    A -->|Structured JSON| U
-    W -->|Static assets| U
+flowchart TD
+    U[Browser] --> W[Cloudflare Worker]
+    W --> V[HTTP and input validation]
+    V --> E[DNS tools or IP calculation]
+    E --> D[Bounded DNS client]
+    D --> R[Cloudflare DNS at 1.1.1.1]
+    E --> J[Deterministic JSON evidence]
+    J --> U
+    W --> U
 ```
+
+## Public API surfaces
+
+| Route | Input | Purpose | Bounded behavior |
+| --- | --- | --- | --- |
+| `GET /api/health` | None | Service metadata | Performs no DNS work |
+| `POST /api/scan` | Public `domain` | Email-authentication posture and core DNS context | Fixed checks, bounded DKIM selector set, bounded SPF traversal |
+| `POST /api/lookup` | `name` and allowlisted `type` | One DNS lookup or SPF analysis | Ten native record types; `SPF` is a TXT-backed analysis mode |
+| `POST /api/dns-snapshot` | Public `domain` | Explicit apex RRsets and security-owner TXT | Eight fixed apex types, four fixed security owners, at most two infrastructure hosts |
+| `POST /api/host-discovery` | Public `domain` and `core` or `extended` | Common-name discovery | Seven fixed labels and one random wildcard probe per request |
+| `POST /api/ip-network` | One IPv4/IPv6 address, CIDR, or dotted IPv4 netmask | Deterministic network calculation and DNS evidence | Local arithmetic; at most four logical DNS enrichment queries for one global address |
+
+The DNS-surface interface requests the snapshot, core profile, and extended profile separately. Each request has its own DNS budget and returns independently, so one partial or failed request does not erase usable evidence from the others.
+
+## Request paths
+
+### Email-authentication scan
+
+The main scan resolves DMARC, SPF, a small documented DKIM selector set, mail routing, transport-security records, and core DNS context. Deterministic parsers create findings, remediation guidance, posture, and a configuration score.
+
+### Direct lookup and SPF analysis
+
+Direct lookup allowlists A, AAAA, CAA, CNAME, MX, NS, PTR, SOA, SRV, and TXT. PTR input is converted to a reverse-DNS owner; other types accept a validated public DNS owner name. Non-CNAME lookups can follow a bounded alias chain while preserving the terminal owner.
+
+`SPF` does not query the obsolete SPF resource-record type. It accepts a validated public DNS owner, including underscore-prefixed provider policy owners, queries TXT, keeps separate TXT resource records separate, and selects only complete `v=spf1` policies. Static parsing and bounded recursive traversal expose mechanisms, qualifiers, address ranges, terminal policy, expanded domains, syntax errors, warnings, and a worst-case lookup estimate. Unknown, macro-dependent, cyclic, over-depth, and over-budget branches remain explicitly incomplete.
+
+### Explicit DNS snapshot
+
+The snapshot queries A, AAAA, CAA, CNAME, MX, NS, SOA, and TXT at the requested domain. It separately queries TXT at:
+
+- `_dmarc.<domain>`
+- `_mta-sts.<domain>`
+- `_smtp._tls.<domain>`
+- `default._bimi.<domain>`
+
+MX and NS answers can contribute up to two infrastructure hostnames for direct A/AAAA enrichment. This is relationship context, not recursive asset expansion.
+
+### Bounded host discovery
+
+The `core` and `extended` profiles each contain seven fixed labels. For every candidate, the resolver checks CNAME and then direct A/AAAA at either the candidate or its one discovered alias. The request also checks one cryptographically unpredictable label under the same domain. If a candidate's alias/address fingerprint matches that control, the result is tagged `wildcardMatch`; it is not silently counted as a uniquely configured host.
+
+The API accepts no caller-supplied label list or wordlist. Discovery does not recurse through host relationships, expand netblocks, connect to returned addresses, or make PTR requests.
+
+### IP and subnet calculation
+
+The IP endpoint strictly parses one address or CIDR; IPv4 also accepts a contiguous dotted netmask. It rejects URLs, lists, explicit ranges, scoped IPv6, ambiguous IPv4, and malformed prefixes. Big-integer arithmetic calculates canonical form, network/last address, total and usable ranges, address classification, and IPv4 netmask/wildcard/broadcast without upstream traffic.
+
+DNS enrichment is eligible only when the input is a single globally routable address, whether bare or explicitly `/32` or `/128`. It performs PTR plus Team Cymru origin-AS TXT queries and can resolve AS descriptions within a four-logical-query ceiling. Team Cymru evidence is explicitly attributed and defensively parsed. Multi-address CIDRs and special-use addresses receive `not-applicable` enrichment without DNS work. Enrichment failure produces partial or indeterminate evidence but does not fail a valid local calculation. The dedicated UI validates the response contract before rendering it and exposes the same evidence states as the API.
+
+## Result and failure model
+
+DNS absence and DNS unavailability have different meanings:
+
+| State | Meaning | Client behavior |
+| --- | --- | --- |
+| `found` | One or more records were returned | Show the raw records |
+| `empty` | The resolver reported no answer for this type/name | Show absence without inventing a failure |
+| `unavailable` | Timeout, refusal, transport failure, or another indeterminate resolver error | Preserve partial results and invite retry |
+
+Snapshot groups and security records use these states directly. If some snapshot queries are unavailable, the endpoint returns `200` with `unavailableCount`; if every apex RRset group is unavailable, it returns a sanitized `502`. Host discovery returns successfully resolved candidates alongside `unavailableNames`; an unavailable candidate is never treated as absent. The three DNS-surface requests can therefore render partial data and request-specific errors without stale results from an earlier domain.
 
 ## Trust boundaries
 
 ### Browser input
 
-The scan API accepts a single public domain value. It rejects email addresses, IP literals, credentials, ports, paths, local names, malformed labels, and overlong values. The advanced lookup API accepts a validated public DNS owner name and an allowlisted record type; PTR additionally accepts an IP literal and converts it to a reverse owner name. The user cannot choose the upstream resolver or target URL.
+JSON requests are limited to 2,048 bytes and required object keys. Domain routes accept a normalized public domain: they reject email addresses, IP literals, credentials, ports, paths, local names, malformed labels, and overlong values. Direct lookup accepts a validated public owner and an allowlisted mode; PTR accepts one IP address. The IP calculator accepts one strict address/CIDR but never uses a CIDR as an active scan range. Callers cannot select an upstream resolver, arbitrary protocol, URL, port, DNS record type, or discovery label.
 
 ### DNS answers
 
-Every record is attacker-controlled text. DNS data is validated against answer-count and character-volume limits, normalized, and returned as JSON. React renders values as text; no raw HTML rendering is used.
+Every DNS answer is attacker-controlled data. The DNS layer caps answer counts and character volume, normalizes values, preserves TXT resource-record boundaries, and returns JSON. The React client renders values as text and does not insert record data as raw HTML.
 
 ### Upstream requests
 
-All resolution uses the Worker's fixed native DNS resolver. The scanner cannot select an upstream host or fetch a URL derived from user input, preventing the scan endpoint from becoming a general-purpose SSRF proxy.
+All resolution uses Cloudflare Workers' fixed native `node:dns` resolver. Concurrency, time, CNAME traversal, SPF recursion, result size, and physical query attempts are bounded and cached within a request. IP attribution uses Team Cymru's published DNS mapping service rather than an HTTP fetch. The Worker never converts a returned host, IP address, TXT value, or CNAME into an HTTP request or service connection.
 
-## Request flow
+## Completeness boundary
 
-1. Validate HTTP method, content type, and body size.
-2. Normalize and validate the requested public domain.
-3. Execute native DNS queries with bounded concurrency, retry handling, whole-query timeouts, result-size limits, per-request caching, bounded CNAME following, and a shared subrequest budget.
-4. Parse TXT record boundaries without combining separate resource records.
-5. Analyze DMARC, SPF, core DNS health, mail routing, transport controls, and limited DKIM selector evidence.
-6. Produce stable check identifiers and deterministic findings.
-7. Return JSON with `Cache-Control` and security headers.
+The snapshot uses explicit record-type queries; it does not use `ANY`. `ANY` means “whatever data the server chooses to return for this owner,” not “all records in the zone,” and authoritative servers may intentionally minimize it under [RFC 8482](https://www.rfc-editor.org/rfc/rfc8482.html). Neither approach discovers unknown owner names.
+
+Common-name discovery tests only its documented labels. The Worker does not consume certificate-transparency logs, historical/passive-DNS databases, search indexes, crawling datasets, or zone transfers. Its output is therefore not exhaustive and is not DNSDumpster-equivalent passive data.
+
+## Active-tool boundary
+
+This public anonymous Worker deliberately excludes port and vulnerability scanning, ping, traceroute, AXFR, banner collection, arbitrary HTTP fetches, and other HackerTarget-like active probes. Exposing those operations anonymously would let callers turn the service into a scanning relay or SSRF primitive, impose traffic on third-party targets, and make per-target authorization and abuse response impossible to enforce reliably.
+
+Any future active-scanning plane must be separate from the public DNS API and require, at minimum:
+
+- Authenticated users and auditable identities
+- Proof that the user controls the target domain or address, with special handling for shared infrastructure
+- Allowlisted operations and target scope
+- Per-user and per-target quotas, concurrency controls, and rate limits
+- Durable queues, cancellation, bounded retries, and result-expiry rules
+- Isolated, deny-by-default egress with protection for private, link-local, metadata, and control-plane ranges
+- Output, time, redirect, and response-size limits
+- Abuse reporting, suspension, retention, and operator review controls
+
+The deterministic IP/CIDR tool does not change this boundary: its UI and API may request reverse and attribution DNS only for the exact single global address supplied, and they never send packets to that address.
 
 ## Why AI is not in the core scanner
 

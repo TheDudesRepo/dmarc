@@ -85,6 +85,49 @@ describe("SPF parser", () => {
     expect(parsed.errors.join(" ")).toMatch(/Duplicate redirect/u);
   });
 
+  it.each([
+    "v=spf1 include:bad..example.com -all",
+    "v=spf1 include:-bad.example -all",
+    "v=spf1 redirect=bad..example",
+  ])("rejects a malformed static domain-spec in %s", (record) => {
+    const parsed = parseSpfRecord(record);
+    expect(parsed.valid).toBe(false);
+    expect(parsed.errors.join(" ")).toMatch(/invalid domain-spec/u);
+  });
+
+  it("accepts valid RFC-style macro expressions as statically incomplete domain-specs", () => {
+    const parsed = parseSpfRecord("v=spf1 exists:%{ir}.%{l1r+}.%{d} a:%{l1r-/}.example.com//64 -all");
+    expect(parsed.valid).toBe(true);
+    expect(parsed.mechanisms[0]?.domainSpec).toBe("%{ir}.%{l1r+}.%{d}");
+    expect(parsed.mechanisms[1]).toEqual(expect.objectContaining({
+      name: "a",
+      domainSpec: "%{l1r-/}.example.com",
+      cidr6: 64,
+    }));
+  });
+
+  it.each([
+    "v=spf1 include:%{ -all",
+    "v=spf1 include:%{z}.example.com -all",
+    "v=spf1 include:%{d0}.example.com -all",
+    "v=spf1 include:%{d.example.com -all",
+    "v=spf1 include:%{d}.123 -all",
+    "v=spf1 include:%{d}tail -all",
+  ])("rejects a malformed or unknown macro expression in %s", (record) => {
+    const parsed = parseSpfRecord(record);
+    expect(parsed.valid).toBe(false);
+    expect(parsed.errors.join(" ")).toMatch(/invalid domain-spec/u);
+  });
+
+  it("rejects numeric static top labels and malformed macros in unknown modifiers", () => {
+    const numeric = parseSpfRecord("v=spf1 include:example.123 -all");
+    const unknownModifier = parseSpfRecord("v=spf1 foo=%(bad) -all");
+    expect(numeric.valid).toBe(false);
+    expect(numeric.errors.join(" ")).toMatch(/invalid domain-spec/u);
+    expect(unknownModifier.valid).toBe(false);
+    expect(unknownModifier.errors.join(" ")).toMatch(/invalid macro syntax/u);
+  });
+
   it("preserves TXT RR boundaries when selecting SPF records", () => {
     expect(findSpfRecords(["v=spf1 -all", "v=spf1 include:x.example -all", "unrelated=value"])).toHaveLength(2);
   });
@@ -121,5 +164,18 @@ describe("recursive SPF lookup estimate", () => {
 
     expect(estimate.count).toBe(11);
     expect(estimate.exceedsLimit).toBe(true);
+  });
+
+  it("stops recursive DNS expansion at the overall analysis deadline", async () => {
+    const root = parseSpfRecord("v=spf1 include:slow.example -all");
+    const estimate = await estimateSpfLookups(
+      "root.example",
+      root,
+      () => new Promise<string[]>(() => undefined),
+      { timeoutMs: 2 },
+    );
+
+    expect(estimate.truncated).toBe(true);
+    expect(estimate.issues.join(" ")).toMatch(/overall analysis deadline/iu);
   });
 });

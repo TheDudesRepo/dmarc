@@ -410,7 +410,9 @@ function assertStringArray(value: unknown): asserts value is string[] {
 }
 
 function isStructuredEmailTxt(value: string): boolean {
-  return /^(?:v=(?:spf1|dmarc1|dkim1|bimi1|tlsrptv1|stsv1)\b|(?:k=[^;]+;\s*)?p=)/iu.test(value.trimStart());
+  return /^(?:v=(?:spf1|dmarc1|dkim1|bimi1|tlsrptv1|stsv1)\b|(?:k=(?:rsa|ed25519)|t=(?:s|y|s:y|y:s))\s*;|(?:k=[^;]+;\s*)?p=)/iu.test(
+    value.trimStart(),
+  );
 }
 
 function normalizeDnsQueryName(name: string): string {

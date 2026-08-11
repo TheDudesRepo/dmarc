@@ -178,6 +178,14 @@ describe("Cloudflare native DNS resolver", () => {
     ]);
   });
 
+  it("repairs DKIM records that put flags between the key type and public key", () => {
+    const workerdValue = 'k=rsa; t=s; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A" "MIIBCgKCAQEA';
+
+    expect(joinDnsTxtChunks([workerdValue])).toBe(
+      "k=rsa; t=s; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA",
+    );
+  });
+
   it("preserves separate TXT RRs and does not alter literal quotes in unrelated TXT data", async () => {
     const client = new DnsClient({
       resolver: nativeResolver({

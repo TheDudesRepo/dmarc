@@ -18,7 +18,7 @@ describe("Worker API boundary", () => {
     const body = (await response.json()) as { status: string; version: string; deploymentId: string | null };
 
     expect(response.status).toBe(200);
-    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.2.1", deploymentId: null }));
+    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.2.2", deploymentId: null }));
     expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.headers.get("cache-control")).toContain("no-store");

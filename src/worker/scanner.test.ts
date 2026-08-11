@@ -44,7 +44,58 @@ describe("deterministic scan engine", () => {
     const resolver = new FakeResolver({}, new Set(["TXT:_dmarc.example.com"]));
     await expect(scanDomain("example.com", resolver)).rejects.toBeInstanceOf(ScanUpstreamError);
   });
+
+  it("surfaces weaker sp and np policies without changing the organizational-domain posture", async () => {
+    const strongPolicy = await scanWithDmarc(
+      "v=DMARC1; p=reject; rua=mailto:dmarc@example.com",
+    );
+    const scopedExceptions = await scanWithDmarc(
+      "v=DMARC1; p=reject; sp=none; np=quarantine; rua=mailto:dmarc@example.com",
+    );
+    const details = Object.fromEntries(
+      scopedExceptions.checks.dmarc.details.map((detail) => [detail.label, detail.value]),
+    );
+
+    expect(scopedExceptions.posture).toBe("reject");
+    expect(scopedExceptions.postureLabel).toMatch(/scoped exceptions/u);
+    expect(scopedExceptions.headline).toMatch(/declares weaker policies for existing and nonexistent subdomains/u);
+    expect(scopedExceptions.summary).toMatch(/existing subdomains declare none/iu);
+    expect(scopedExceptions.checks.dmarc.status).toBe("warning");
+    expect(details["Organizational-domain policy (p)"]).toMatch(/^reject \(explicit p tag\)$/u);
+    expect(details["Existing-subdomain policy (sp)"]).toMatch(/^none \(explicit sp tag\)$/u);
+    expect(details["Nonexistent-subdomain policy (np)"]).toMatch(/^quarantine \(explicit np tag\)$/u);
+    expect(scopedExceptions.findings.map((finding) => finding.id)).toEqual(
+      expect.arrayContaining(["dmarc-weaker-sp-policy", "dmarc-weaker-np-policy"]),
+    );
+    expect(scopedExceptions.score).toBeLessThan(strongPolicy.score);
+  });
+
+  it("explains sp and np inheritance and applies test mode to every policy scope", async () => {
+    const inherited = await scanWithDmarc(
+      "v=DMARC1; p=reject; t=y; rua=mailto:dmarc@example.com",
+    );
+    const details = Object.fromEntries(inherited.checks.dmarc.details.map((detail) => [detail.label, detail.value]));
+
+    expect(inherited.posture).toBe("quarantine");
+    expect(details["Organizational-domain policy (p)"]).toMatch(/t=y expects quarantine handling/u);
+    expect(details["Existing-subdomain policy (sp)"]).toMatch(/inherits p=reject.*t=y expects quarantine handling/u);
+    expect(details["Nonexistent-subdomain policy (np)"]).toMatch(/inherits p=reject.*t=y expects quarantine handling/u);
+    expect(inherited.checks.dmarc.summary).toMatch(
+      /expected handling is quarantine for the domain, quarantine for existing subdomains, and quarantine for nonexistent subdomains/u,
+    );
+    expect(inherited.findings.map((finding) => finding.id)).not.toEqual(
+      expect.arrayContaining(["dmarc-weaker-sp-policy", "dmarc-weaker-np-policy"]),
+    );
+  });
 });
+
+async function scanWithDmarc(record: string) {
+  const records: Record<string, DnsAnswer[]> = {
+    "TXT:_dmarc.example.com": [txt("_dmarc.example.com", record)],
+    "TXT:example.com": [txt("example.com", "v=spf1 -all")],
+  };
+  return scanDomain("example.com", new FakeResolver(records));
+}
 
 function txt(name: string, data: string): DnsAnswer {
   return { name, type: "TXT", data, ttl: 300 };

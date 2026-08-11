@@ -5,7 +5,7 @@ import type {
   FindingSeverity,
   ScanResult,
 } from "../shared/types";
-import { type DmarcPolicy, findDmarcRecords, parseDmarcRecord } from "./dmarc";
+import { type DmarcPolicy, type ParsedDmarcRecord, findDmarcRecords, parseDmarcRecord } from "./dmarc";
 import { DnsClient, DnsQueryError, type DnsAnswer, type DnsQueryType, toRecordViews } from "./dns";
 import { estimateSpfLookups, findSpfRecords, parseSpfRecord, type SpfLookupEstimate } from "./spf";
 
@@ -26,10 +26,24 @@ interface OptionalDnsResult {
 interface DmarcAnalysis {
   check: CheckResult;
   policy?: DmarcPolicy;
+  scope?: DmarcScopeAnalysis;
   testing: boolean;
   posture: ScanResult["posture"];
   points: number;
   findings: Finding[];
+}
+
+interface DmarcScopeAnalysis {
+  organizationalPolicy: DmarcPolicy;
+  subdomainPolicy: DmarcPolicy;
+  nonexistentSubdomainPolicy: DmarcPolicy;
+  effectiveOrganizationalPolicy: DmarcPolicy;
+  effectiveSubdomainPolicy: DmarcPolicy;
+  effectiveNonexistentSubdomainPolicy: DmarcPolicy;
+  subdomainSource: "p" | "sp";
+  nonexistentSubdomainSource: "p" | "sp" | "np";
+  weakerSubdomainPolicy: boolean;
+  weakerNonexistentSubdomainPolicy: boolean;
 }
 
 interface SpfAnalysis {
@@ -143,7 +157,7 @@ export async function scanDomain(domain: string, dns: DnsResolver = new DnsClien
       (ns.answers.length > 0 ? 2 : 0),
   );
   const grade = gradeForScore(score);
-  const presentation = posturePresentation(dmarc.posture, dmarc.policy, dmarc.testing);
+  const presentation = posturePresentation(dmarc.posture, dmarc.policy, dmarc.testing, dmarc.scope);
 
   return {
     domain,
@@ -255,13 +269,20 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
   }
 
   const policy = parsed.policy;
-  const effectivePolicy = parsed.testing ? downgradePolicy(policy) : policy;
-  const points = effectivePolicy === "none" ? 16 : effectivePolicy === "quarantine" ? 40 : 45;
-  const status = effectivePolicy === "none" || parsed.testing ? "warning" : "pass";
+  const scope = analyzeDmarcScope(parsed);
+  const effectivePolicy = scope.effectiveOrganizationalPolicy;
+  const points = Math.min(
+    dmarcPolicyPoints(scope.effectiveOrganizationalPolicy),
+    dmarcPolicyPoints(scope.effectiveSubdomainPolicy),
+    dmarcPolicyPoints(scope.effectiveNonexistentSubdomainPolicy),
+  );
+  const hasWeakerScopedPolicy = scope.weakerSubdomainPolicy || scope.weakerNonexistentSubdomainPolicy;
+  const status = effectivePolicy === "none" || parsed.testing || hasWeakerScopedPolicy ? "warning" : "pass";
+  const policyFindingSeverity = effectivePolicy === "none" || parsed.testing ? "warning" : "success";
   const findings: Finding[] = [
     {
       id: `dmarc-policy-${policy}`,
-      severity: status === "pass" ? "success" : "warning",
+      severity: policyFindingSeverity,
       title: `DMARC policy is p=${policy}${parsed.testing ? "; t=y" : ""}`,
       detail:
         policy === "none"
@@ -273,6 +294,7 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
         ? { action: "Use aggregate reports to inventory and remediate legitimate senders before moving gradually toward enforcement." }
         : {}),
     },
+    ...weakerScopedPolicyFindings(scope, parsed.testing),
   ];
 
   if (!parsed.tags.rua) {
@@ -306,15 +328,46 @@ function analyzeDmarc(answers: DnsAnswer[]): DmarcAnalysis {
 
   return {
     policy,
+    scope,
     testing: parsed.testing,
     posture: effectivePolicy === "none" ? "monitoring" : effectivePolicy,
     points,
     check: {
       status,
       title: "DMARC",
-      summary: `One syntactically valid DMARC record was found; declared policy is p=${policy}${parsed.testing ? ` with t=y (expected ${effectivePolicy} handling)` : ""}.`,
+      summary: dmarcCheckSummary(scope, parsed.testing),
       details: [
-        { label: "Declared policy", value: parsed.tags.p ? policy : "none (RFC 9989 default)" },
+        {
+          label: "Organizational-domain policy (p)",
+          value: formatScopedPolicy(
+            scope.organizationalPolicy,
+            scope.effectiveOrganizationalPolicy,
+            parsed.tags.p ? "explicit p tag" : "RFC 9989 p=none default",
+            parsed.testing,
+          ),
+        },
+        {
+          label: "Existing-subdomain policy (sp)",
+          value: formatScopedPolicy(
+            scope.subdomainPolicy,
+            scope.effectiveSubdomainPolicy,
+            scope.subdomainSource === "sp" ? "explicit sp tag" : `inherits p=${scope.organizationalPolicy}`,
+            parsed.testing,
+          ),
+        },
+        {
+          label: "Nonexistent-subdomain policy (np)",
+          value: formatScopedPolicy(
+            scope.nonexistentSubdomainPolicy,
+            scope.effectiveNonexistentSubdomainPolicy,
+            scope.nonexistentSubdomainSource === "np"
+              ? "explicit np tag"
+              : scope.nonexistentSubdomainSource === "sp"
+                ? `inherits sp=${scope.subdomainPolicy}`
+                : `inherits p=${scope.organizationalPolicy}`,
+            parsed.testing,
+          ),
+        },
         { label: "Test mode", value: parsed.testing ? `Yes; expected one-level reduction to ${effectivePolicy}` : "No" },
         ...(parsed.tags.pct ? [{ label: "Historic pct tag", value: `${parsed.tags.pct} (ignored by RFC 9989)` }] : []),
         { label: "Aggregate reports", value: parsed.tags.rua ?? "Not configured" },
@@ -640,30 +693,135 @@ async function optionalDns(promise: Promise<DnsAnswer[]>): Promise<OptionalDnsRe
   }
 }
 
+function analyzeDmarcScope(parsed: ParsedDmarcRecord): DmarcScopeAnalysis {
+  const organizationalPolicy = parsed.policy ?? "none";
+  const subdomainPolicy = parsed.subdomainPolicy ?? organizationalPolicy;
+  const nonexistentSubdomainPolicy = parsed.nonexistentSubdomainPolicy ?? parsed.subdomainPolicy ?? organizationalPolicy;
+  const effective = (policy: DmarcPolicy): DmarcPolicy => parsed.testing ? downgradePolicy(policy) : policy;
+  const strongestBroaderPolicy = policyRank(subdomainPolicy) > policyRank(organizationalPolicy)
+    ? subdomainPolicy
+    : organizationalPolicy;
+
+  return {
+    organizationalPolicy,
+    subdomainPolicy,
+    nonexistentSubdomainPolicy,
+    effectiveOrganizationalPolicy: effective(organizationalPolicy),
+    effectiveSubdomainPolicy: effective(subdomainPolicy),
+    effectiveNonexistentSubdomainPolicy: effective(nonexistentSubdomainPolicy),
+    subdomainSource: parsed.subdomainPolicy ? "sp" : "p",
+    nonexistentSubdomainSource: parsed.nonexistentSubdomainPolicy ? "np" : parsed.subdomainPolicy ? "sp" : "p",
+    weakerSubdomainPolicy: Boolean(
+      parsed.subdomainPolicy && policyRank(subdomainPolicy) < policyRank(organizationalPolicy),
+    ),
+    weakerNonexistentSubdomainPolicy: Boolean(
+      parsed.nonexistentSubdomainPolicy && policyRank(nonexistentSubdomainPolicy) < policyRank(strongestBroaderPolicy),
+    ),
+  };
+}
+
+function weakerScopedPolicyFindings(scope: DmarcScopeAnalysis, testing: boolean): Finding[] {
+  const findings: Finding[] = [];
+
+  if (scope.weakerSubdomainPolicy) {
+    const inheritedNonexistentPolicy = scope.nonexistentSubdomainSource === "sp"
+      ? ` Because np is absent, nonexistent subdomains also inherit sp=${scope.subdomainPolicy}.`
+      : " The np tag separately controls nonexistent subdomains.";
+    findings.push({
+      id: "dmarc-weaker-sp-policy",
+      severity: "warning",
+      title: "Existing subdomains have a weaker DMARC policy",
+      detail: `The record declares p=${scope.organizationalPolicy}, but explicit sp=${scope.subdomainPolicy} requests weaker handling for existing subdomains.${inheritedNonexistentPolicy}${testing ? ` With t=y, their expected handling is ${scope.effectiveSubdomainPolicy}.` : ""}`,
+      action: "Confirm that the weaker subdomain policy is intentional and review aggregate evidence before strengthening it.",
+    });
+  }
+
+  if (scope.weakerNonexistentSubdomainPolicy) {
+    const broaderPolicies = [
+      ...(policyRank(scope.nonexistentSubdomainPolicy) < policyRank(scope.organizationalPolicy)
+        ? [`p=${scope.organizationalPolicy}`]
+        : []),
+      ...(policyRank(scope.nonexistentSubdomainPolicy) < policyRank(scope.subdomainPolicy)
+        ? [`${scope.subdomainSource}=${scope.subdomainPolicy}`]
+        : []),
+    ];
+    findings.push({
+      id: "dmarc-weaker-np-policy",
+      severity: "warning",
+      title: "Nonexistent subdomains have a weaker DMARC policy",
+      detail: `Explicit np=${scope.nonexistentSubdomainPolicy} requests weaker handling for nonexistent subdomains than ${broaderPolicies.join(" and ")}.${testing ? ` With t=y, their expected handling is ${scope.effectiveNonexistentSubdomainPolicy}.` : ""}`,
+      action: "Confirm that the weaker nonexistent-subdomain policy is intentional; random subdomain spoofing can otherwise receive less restrictive treatment.",
+    });
+  }
+
+  return findings;
+}
+
+function dmarcCheckSummary(scope: DmarcScopeAnalysis, testing: boolean): string {
+  const declaredScope = [
+    `p=${scope.organizationalPolicy}`,
+    scope.subdomainSource === "sp" ? `sp=${scope.subdomainPolicy}` : `sp inherits p=${scope.subdomainPolicy}`,
+    scope.nonexistentSubdomainSource === "np"
+      ? `np=${scope.nonexistentSubdomainPolicy}`
+      : `np inherits ${scope.nonexistentSubdomainSource}=${scope.nonexistentSubdomainPolicy}`,
+  ].join("; ");
+  const expectedHandling = testing
+    ? ` With t=y, expected handling is ${scope.effectiveOrganizationalPolicy} for the domain, ${scope.effectiveSubdomainPolicy} for existing subdomains, and ${scope.effectiveNonexistentSubdomainPolicy} for nonexistent subdomains.`
+    : "";
+  return `One syntactically valid DMARC record was found. Declared scope: ${declaredScope}.${expectedHandling}`;
+}
+
+function formatScopedPolicy(
+  declaredPolicy: DmarcPolicy,
+  effectivePolicy: DmarcPolicy,
+  source: string,
+  testing: boolean,
+): string {
+  const testMode = testing && declaredPolicy !== "none"
+    ? `; t=y expects ${effectivePolicy} handling`
+    : testing
+      ? "; t=y does not reduce none handling"
+      : "";
+  return `${declaredPolicy} (${source})${testMode}`;
+}
+
+function dmarcPolicyPoints(policy: DmarcPolicy): number {
+  if (policy === "reject") return 45;
+  if (policy === "quarantine") return 40;
+  return 16;
+}
+
+function policyRank(policy: DmarcPolicy): number {
+  if (policy === "reject") return 2;
+  if (policy === "quarantine") return 1;
+  return 0;
+}
+
 function posturePresentation(
   posture: ScanResult["posture"],
   declaredPolicy: DmarcPolicy | undefined,
   testing: boolean,
+  scope: DmarcScopeAnalysis | undefined,
 ): { label: string; headline: string; summary: string } {
   switch (posture) {
     case "reject":
-      return {
+      return qualifyPostureForScope({
         label: "Reject policy published",
         headline: "DMARC requests rejection of failing mail",
         summary: "The DNS policy is at reject, but only aggregate data and mail-flow validation can show whether legitimate senders are aligned.",
-      };
+      }, scope);
     case "quarantine":
-      return {
+      return qualifyPostureForScope({
         label: testing && declaredPolicy === "reject" ? "Reject policy in test mode" : "Quarantine policy published",
         headline: testing && declaredPolicy === "reject" ? "p=reject with t=y signals quarantine-level testing" : "DMARC requests quarantine of failing mail",
         summary: "The DNS configuration indicates quarantine-level handling. This snapshot does not establish safe readiness for a stronger policy.",
-      };
+      }, scope);
     case "monitoring":
-      return {
+      return qualifyPostureForScope({
         label: testing && declaredPolicy === "quarantine" ? "Quarantine policy in test mode" : "Monitoring policy",
         headline: testing && declaredPolicy === "quarantine" ? "p=quarantine with t=y signals monitoring-level testing" : "DMARC is published in monitoring mode",
         summary: "Monitoring-level DMARC can collect visibility through aggregate reports, but it does not request quarantine or rejection of failing messages.",
-      };
+      }, scope);
     case "invalid":
       return {
         label: "Invalid policy",
@@ -677,6 +835,34 @@ function posturePresentation(
         summary: "If this is a subdomain, an organizational-domain policy may still apply. Confirm inheritance before publishing a new record.",
       };
   }
+}
+
+function qualifyPostureForScope(
+  presentation: { label: string; headline: string; summary: string },
+  scope: DmarcScopeAnalysis | undefined,
+): { label: string; headline: string; summary: string } {
+  if (!scope) return presentation;
+
+  const weakerScopes: Array<{ name: string; policy: DmarcPolicy }> = [];
+  if (policyRank(scope.subdomainPolicy) < policyRank(scope.organizationalPolicy)) {
+    weakerScopes.push({ name: "existing subdomains", policy: scope.subdomainPolicy });
+  }
+  if (policyRank(scope.nonexistentSubdomainPolicy) < policyRank(scope.organizationalPolicy)) {
+    weakerScopes.push({ name: "nonexistent subdomains", policy: scope.nonexistentSubdomainPolicy });
+  }
+  if (weakerScopes.length === 0) return presentation;
+
+  const scopeNames = weakerScopes.length === 2
+    ? "existing and nonexistent subdomains"
+    : weakerScopes[0]?.name ?? "scoped domains";
+  const scopePolicies = weakerScopes
+    .map((item) => `${item.name} declare ${item.policy}`)
+    .join(", while ");
+  return {
+    label: `${presentation.label}; scoped exceptions`,
+    headline: `${presentation.headline}; the record declares weaker policies for ${scopeNames}`,
+    summary: `${presentation.summary} ${scopePolicies[0]?.toUpperCase() ?? ""}${scopePolicies.slice(1)}, below p=${scope.organizationalPolicy}.`,
+  };
 }
 
 function downgradePolicy(policy: DmarcPolicy): DmarcPolicy {

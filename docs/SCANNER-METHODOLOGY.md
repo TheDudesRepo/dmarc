@@ -11,12 +11,12 @@ The scanner looks for DMARC-version TXT records at `_dmarc.<domain>`, preserves 
 - Version placement and value
 - Duplicate records and tags
 - Requested policy
-- Subdomain policy
+- Existing- and nonexistent-subdomain policy, including `sp`/`np` inheritance
 - Aggregate-reporting destinations
 - Alignment modes
 - Testing and legacy rollout tags
 
-The result is a configuration stage: missing, invalid, monitoring, quarantine, or reject. The language says receivers are **asked** to apply a disposition because final message handling remains receiver policy.
+The result is a configuration stage: missing, invalid, monitoring, quarantine, or reject. That primary stage follows the effective `p` policy, while headlines and findings explicitly qualify weaker `sp` or `np` coverage. The language says receivers are **asked** to apply a disposition because final message handling remains receiver policy.
 
 ## SPF
 
@@ -42,7 +42,7 @@ These controls are reported separately from DMARC policy. Missing optional contr
 
 ## Configuration score
 
-The score summarizes published configuration. It is not a security rating and is not enforcement approval. Policy stage always takes precedence over the number shown.
+The score summarizes published configuration. It is not a security rating and is not enforcement approval. DMARC policy points use the weakest effective policy across `p`, inherited or explicit `sp`, and inherited or explicit `np`, so a strong organizational-domain policy cannot hide a weaker scoped exception. Policy stage always takes precedence over the number shown.
 
 Aggregate-report history, sender ownership, business confirmation, and change monitoring are required before recommending quarantine or reject for an active production domain.
 

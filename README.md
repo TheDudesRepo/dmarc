@@ -34,6 +34,7 @@ The current release is an intentionally focused MVP: no accounts, no mailbox acc
 - Wrangler
 
 The frontend and API Worker deploy as one Cloudflare Worker. Static files are served from the Vite `dist` directory and `/api/*` routes run through the Worker.
+The `global_fetch_strictly_public` compatibility flag allows the Worker to reach Cloudflare's public DNS-over-HTTPS endpoint as an external dependency.
 
 ## Local development
 

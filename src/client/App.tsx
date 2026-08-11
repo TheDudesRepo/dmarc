@@ -503,7 +503,7 @@ function Results({
             <div className="metadata-card">
               <h3><ServerCog aria-hidden="true" /> Observed infrastructure</h3>
               <dl>
-                <div><dt>Mail providers</dt><dd>{result.metadata.mxProviders.join(", ") || "Not identified"}</dd></div>
+                <div><dt>MX hosts</dt><dd>{result.metadata.mxProviders.join(", ") || "Not identified"}</dd></div>
                 <div><dt>Nameservers</dt><dd>{result.metadata.nameservers.slice(0, 3).join(", ") || "Not returned"}</dd></div>
                 <div><dt>MTA-STS</dt><dd>{result.metadata.hasMtaSts ? "Published" : "Not detected"}</dd></div>
                 <div><dt>TLS reporting</dt><dd>{result.metadata.hasTlsRpt ? "Published" : "Not detected"}</dd></div>

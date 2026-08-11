@@ -83,8 +83,9 @@ export async function lookupDns(
   let answers: DnsAnswer[];
   try {
     answers = await dns.query(request.queryName, request.type);
-  } catch {
-    throw new LookupUpstreamError("The DNS lookup could not be completed.");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "DNS resolver failed without a typed error.";
+    throw new LookupUpstreamError(detail);
   }
 
   const records = toRecordViews(answers);

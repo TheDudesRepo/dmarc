@@ -136,7 +136,9 @@ async function handleLookup(request: Request): Promise<Response> {
       return errorResponse(error.message, "BAD_REQUEST", 400);
     }
     if (error instanceof LookupUpstreamError) {
-      return errorResponse("DNS data is temporarily unavailable. Please try again.", "UPSTREAM_ERROR", 502);
+      const response = errorResponse("DNS data is temporarily unavailable. Please try again.", "UPSTREAM_ERROR", 502);
+      response.headers.set("X-DNS-Upstream-State", error.message.slice(0, 160));
+      return response;
     }
     return errorResponse("The DNS lookup could not be completed. Please try again.", "UPSTREAM_ERROR", 502);
   }

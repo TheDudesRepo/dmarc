@@ -29,12 +29,19 @@ const MAX_ATTEMPTS = 2;
 const MAX_CONCURRENT_DNS_QUERIES = 6;
 const MAX_DNS_ANSWERS = 256;
 const MAX_DNS_RESULT_CHARACTERS = 262_144;
+const MAX_CNAME_HOPS = 8;
 
 export interface DnsAnswer {
   name: string;
   type: DnsQueryType;
   ttl?: number;
   data: string;
+}
+
+export interface DnsFollowingResult {
+  answers: DnsAnswer[];
+  canonicalName: string;
+  aliases: DnsAnswer[];
 }
 
 /** Injectable subset of node:dns used by the Worker. */
@@ -79,7 +86,10 @@ const DEFAULT_TIMING: DnsTiming = {
 };
 
 export class DnsClient {
-  private readonly cache = new Map<string, Promise<DnsAnswer[]>>();
+  private readonly queryCache = new Map<string, Promise<DnsAnswer[]>>();
+  private readonly directCache = new Map<string, Promise<DnsAnswer[]>>();
+  private readonly canonicalCache = new Map<string, Promise<DnsFollowingResult>>();
+  private readonly cnameChainCache = new Map<string, Promise<Omit<DnsFollowingResult, "answers">>>();
   private readonly resolver: NativeDnsResolver;
   private readonly timing: DnsTiming;
   private readonly timeoutMs: number;
@@ -94,19 +104,119 @@ export class DnsClient {
   }
 
   query(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
+    if (type === "CNAME") return this.queryDirect(name, type);
+
     const safeName = normalizeDnsQueryName(name);
     validateDnsQueryType(type);
-    const cacheKey = `${type}:${safeName}`;
-    const cached = this.cache.get(cacheKey);
+    const cacheKey = `FOLLOW:${type}:${safeName}`;
+    const cached = this.queryCache.get(cacheKey);
     if (cached) return cached;
 
-    const query = this.withQuerySlot(() => this.resolveQuery(safeName, type));
-    this.cache.set(cacheKey, query);
+    const query = this.queryFollowingCname(safeName, type).then((result) => result.answers);
+    this.queryCache.set(cacheKey, query);
     return query;
   }
 
-  private async withQuerySlot<T>(operation: () => Promise<T>): Promise<T> {
-    await this.acquireQuerySlot();
+  /** Run one native query without following aliases. Used internally for CNAME hops and terminal records. */
+  queryDirect(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
+    const safeName = normalizeDnsQueryName(name);
+    validateDnsQueryType(type);
+    return this.queryDirectUntil(safeName, type, this.timing.now() + this.timeoutMs);
+  }
+
+  /** Follow CNAMEs before asking Workerd to normalize a terminal record type. */
+  queryFollowingCname(
+    name: string,
+    type: Exclude<DnsQueryType, "CNAME">,
+  ): Promise<DnsFollowingResult> {
+    const safeName = normalizeDnsQueryName(name);
+    validateDnsQueryType(type);
+    const cacheKey = `FOLLOW:${type}:${safeName}`;
+    const cached = this.canonicalCache.get(cacheKey);
+    if (cached) return cached;
+
+    const deadline = this.timing.now() + this.timeoutMs;
+    const query = this.withLogicalQueryDeadline(deadline, async () => {
+      const chain = await this.resolveCnameChain(safeName, deadline);
+      const answers = await this.queryDirectUntil(chain.canonicalName, type, deadline);
+      return { answers, canonicalName: chain.canonicalName, aliases: chain.aliases };
+    });
+    this.canonicalCache.set(cacheKey, query);
+    return query;
+  }
+
+  /**
+   * Workerd's node:dns adapter currently passes CNAME and terminal answers to
+   * type-specific normalizers. Resolve the alias chain first so a CNAME cannot
+   * be mislabeled as an address/TXT/NS value or break a structured parser.
+   */
+  private resolveCnameChain(
+    name: string,
+    deadline: number,
+  ): Promise<Omit<DnsFollowingResult, "answers">> {
+    const cached = this.cnameChainCache.get(name);
+    if (cached) return this.withLogicalQueryDeadline(deadline, () => cached);
+
+    const query = this.withLogicalQueryDeadline(deadline, () => this.resolveCnameChainUncached(name, deadline));
+    this.cnameChainCache.set(name, query);
+    return query;
+  }
+
+  private async resolveCnameChainUncached(
+    name: string,
+    deadline: number,
+  ): Promise<Omit<DnsFollowingResult, "answers">> {
+    let current = name;
+    const visited = new Set([current]);
+    const chain: DnsAnswer[] = [];
+
+    for (let hop = 0; ; hop += 1) {
+      const aliases = await this.queryDirectUntil(current, "CNAME", deadline);
+      if (aliases.length === 0) {
+        return { canonicalName: current, aliases: chain };
+      }
+      if (hop >= MAX_CNAME_HOPS) throw new DnsQueryError("DNS CNAME chain exceeded the safety limit.");
+
+      const alias = aliases[0];
+      const target = normalizeDnsQueryName(alias?.data ?? "");
+      if (visited.has(target)) {
+        throw new DnsQueryError("DNS returned a CNAME loop.");
+      }
+      if (alias) chain.push(alias);
+      visited.add(target);
+      current = target;
+    }
+  }
+
+  private queryDirectUntil(name: string, type: DnsQueryType, deadline: number): Promise<DnsAnswer[]> {
+    const cacheKey = `DIRECT:${type}:${name}`;
+    const cached = this.directCache.get(cacheKey);
+    if (cached) return this.withLogicalQueryDeadline(deadline, () => cached);
+
+    const query = this.withQuerySlot(deadline, () => this.resolveQuery(name, type, deadline));
+    this.directCache.set(cacheKey, query);
+    return this.withLogicalQueryDeadline(deadline, () => query);
+  }
+
+  private withLogicalQueryDeadline<T>(deadline: number, operation: () => Promise<T>): Promise<T> {
+    const remainingMs = deadline - this.timing.now();
+    if (remainingMs <= 0) return Promise.reject(new DnsQueryError("DNS resolver timed out."));
+
+    let timeoutHandle: unknown;
+    const timeout = new Promise<never>((_, reject) => {
+      timeoutHandle = this.timing.setTimeout(
+        () => reject(new DnsQueryError("DNS resolver timed out.")),
+        remainingMs,
+      );
+    });
+
+    return Promise.race([operation(), timeout]).finally(() => {
+      if (timeoutHandle !== undefined) this.timing.clearTimeout(timeoutHandle);
+    });
+  }
+
+  private async withQuerySlot<T>(deadline: number, operation: () => Promise<T>): Promise<T> {
+    await this.acquireQuerySlot(deadline);
     try {
       return await operation();
     } finally {
@@ -114,17 +224,34 @@ export class DnsClient {
     }
   }
 
-  private acquireQuerySlot(): Promise<void> {
+  private acquireQuerySlot(deadline: number): Promise<void> {
     if (this.activeQueries < MAX_CONCURRENT_DNS_QUERIES) {
       this.activeQueries += 1;
       return Promise.resolve();
     }
 
-    return new Promise((resolve) => {
-      this.queryWaiters.push(() => {
+    const remainingMs = deadline - this.timing.now();
+    if (remainingMs <= 0) return Promise.reject(new DnsQueryError("DNS resolver timed out."));
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timeoutHandle: unknown;
+      const activate = () => {
+        if (settled) return;
+        settled = true;
+        if (timeoutHandle !== undefined) this.timing.clearTimeout(timeoutHandle);
         this.activeQueries += 1;
         resolve();
-      });
+      };
+
+      timeoutHandle = this.timing.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        const waiterIndex = this.queryWaiters.indexOf(activate);
+        if (waiterIndex >= 0) this.queryWaiters.splice(waiterIndex, 1);
+        reject(new DnsQueryError("DNS resolver timed out."));
+      }, remainingMs);
+      this.queryWaiters.push(activate);
     });
   }
 
@@ -134,15 +261,12 @@ export class DnsClient {
     if (next) next();
   }
 
-  private async resolveQuery(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
-    const deadline = this.timing.now() + this.timeoutMs;
-
+  private async resolveQuery(name: string, type: DnsQueryType, deadline: number): Promise<DnsAnswer[]> {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-      const remainingMs = deadline - this.timing.now();
-      if (remainingMs <= 0) throw new DnsQueryError("DNS resolver timed out.");
+      if (deadline - this.timing.now() <= 0) throw new DnsQueryError("DNS resolver timed out.");
 
       try {
-        return await this.resolveAttempt(name, type, remainingMs);
+        return await this.resolveAttempt(name, type);
       } catch (error) {
         if (isDnsAbsenceError(error)) return [];
 
@@ -156,27 +280,18 @@ export class DnsClient {
     throw new DnsQueryError("DNS resolver could not be reached.");
   }
 
-  private async resolveAttempt(name: string, type: DnsQueryType, timeoutMs: number): Promise<DnsAnswer[]> {
+  private async resolveAttempt(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
     if (this.subrequestCount >= MAX_DNS_SUBREQUESTS) {
       throw new DnsQueryError("The DNS lookup safety limit was reached.");
     }
     this.subrequestCount += 1;
 
-    let timeoutHandle: unknown;
-    const timeout = new Promise<never>((_, reject) => {
-      timeoutHandle = this.timing.setTimeout(
-        () => reject(new DnsQueryError("DNS resolver timed out.")),
-        timeoutMs,
-      );
-    });
-
-    try {
-      const answers = await Promise.race([this.resolveNative(name, type), timeout]);
-      validateAnswerSet(answers);
-      return answers;
-    } finally {
-      if (timeoutHandle !== undefined) this.timing.clearTimeout(timeoutHandle);
-    }
+    // node:dns promises are not abortable. The outer logical deadline can stop
+    // waiting, but this native operation retains its concurrency slot until it
+    // settles so timed-out work cannot exceed the six-query ceiling.
+    const answers = await this.resolveNative(name, type);
+    validateAnswerSet(answers);
+    return answers;
   }
 
   private async resolveNative(name: string, type: DnsQueryType): Promise<DnsAnswer[]> {
@@ -217,16 +332,17 @@ export function toRecordViews(answers: DnsAnswer[]): DnsRecordView[] {
 /**
  * Join the character-strings within one TXT RR. Workerd currently sometimes
  * returns Cloudflare JSON presentation boundaries (`" "`) inside a single
- * chunk. Email-authentication records cannot contain that syntax, so remove it
- * only for the structured records this scanner consumes.
+ * chunk. Repair only syntax that cannot be legitimate protocol content.
  */
-export function joinDnsTxtChunks(chunks: readonly string[]): string {
+export function joinDnsTxtChunks(chunks: readonly string[], ownerName?: string): string {
   if (!Array.isArray(chunks) || chunks.some((chunk) => typeof chunk !== "string")) {
     throw new DnsQueryError("DNS resolver returned malformed TXT data.");
   }
 
   const joined = chunks.join("");
-  return isStructuredEmailTxt(joined) ? joined.replace(/"\s+"/gu, "") : joined;
+  const isDkimOwner = ownerName?.toLowerCase().includes("._domainkey.") ?? false;
+  if (isDkimOwner || isDkimTxt(joined)) return repairDkimPublicKeyBoundaries(joined);
+  return isStructuredEmailTxt(joined) ? joined.replace(/"\s*"/gu, "") : joined;
 }
 
 /** Decode quoted DNS presentation data retained for parser and fixture compatibility. */
@@ -301,7 +417,8 @@ function formatMxAnswers(name: string, records: MxRecord[]): DnsAnswer[] {
     if (!isObject(record) || !isUnsignedInteger(record.priority) || typeof record.exchange !== "string") {
       throw new DnsQueryError("DNS resolver returned malformed MX data.");
     }
-    return { name, type: "MX", data: `${record.priority} ${stripFinalDot(record.exchange)}` };
+    const exchange = stripFinalDot(record.exchange) || ".";
+    return { name, type: "MX", data: `${record.priority} ${exchange}` };
   });
 }
 
@@ -379,7 +496,7 @@ function formatSrvAnswers(name: string, records: SrvRecord[]): DnsAnswer[] {
 
 function formatTxtAnswers(name: string, records: string[][]): DnsAnswer[] {
   assertArray(records);
-  return records.map((chunks) => ({ name, type: "TXT", data: joinDnsTxtChunks(chunks) }));
+  return records.map((chunks) => ({ name, type: "TXT", data: joinDnsTxtChunks(chunks, name) }));
 }
 
 function validateAnswerSet(answers: DnsAnswer[]): void {
@@ -410,8 +527,25 @@ function assertStringArray(value: unknown): asserts value is string[] {
 }
 
 function isStructuredEmailTxt(value: string): boolean {
-  return /^(?:v=(?:spf1|dmarc1|dkim1|bimi1|tlsrptv1|stsv1)\b|(?:k=(?:rsa|ed25519)|t=(?:s|y|s:y|y:s))\s*;|(?:k=[^;]+;\s*)?p=)/iu.test(
+  return /^v=(?:spf1|dmarc1|bimi1|tlsrptv1|stsv1)\b/iu.test(
     value.trimStart(),
+  );
+}
+
+function isDkimTxt(value: string): boolean {
+  return /^(?:v=dkim1\b|(?:h|k|n|p|s|t)\s*=)/iu.test(value.trimStart());
+}
+
+/**
+ * Workerd can leak TXT presentation chunk markers into a DKIM public key.
+ * Repair only an impossible marker inside p='s base64 instead of rewriting
+ * the whole record, where quoted text can legitimately appear in n= notes.
+ */
+function repairDkimPublicKeyBoundaries(value: string): string {
+  return value.replace(
+    /((?:^|;)\s*p\s*=\s*)([^;]*)/iu,
+    (_match, prefix: string, publicKey: string) =>
+      `${prefix}${publicKey.replace(/([a-z0-9+/=])"\s*"(?=[a-z0-9+/=])/giu, "$1")}`,
   );
 }
 

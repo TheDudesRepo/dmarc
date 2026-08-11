@@ -1,5 +1,5 @@
 import dns from "node:dns";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "./index";
 
 const env = {
@@ -9,6 +9,10 @@ const env = {
 } as unknown as Parameters<typeof worker.fetch>[1];
 
 describe("Worker API boundary", () => {
+  beforeEach(() => {
+    vi.spyOn(dns.promises, "resolveCname").mockResolvedValue([]);
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -18,7 +22,7 @@ describe("Worker API boundary", () => {
     const body = (await response.json()) as { status: string; version: string; deploymentId: string | null };
 
     expect(response.status).toBe(200);
-    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.2.2", deploymentId: null }));
+    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.2.3", deploymentId: null }));
     expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.headers.get("cache-control")).toContain("no-store");
@@ -143,6 +147,25 @@ describe("Worker API boundary", () => {
     }));
     expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
     expect(response.headers.get("cache-control")).toContain("no-store");
+  });
+
+  it("resolves terminal records at a CNAME target without returning a mislabeled alias", async () => {
+    vi.mocked(dns.promises.resolveCname).mockImplementation(async (name) =>
+      name === "www.example.com" ? ["origin.example.net."] : [],
+    );
+    const resolve4 = vi.spyOn(dns.promises, "resolve4").mockResolvedValue([
+      { address: "192.0.2.25", ttl: 300 },
+    ]);
+
+    const response = await lookupRequest(JSON.stringify({ name: "www.example.com", type: "A" }));
+
+    expect(response.status).toBe(200);
+    expect(resolve4).toHaveBeenCalledWith("origin.example.net", { ttl: true });
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({
+      queryName: "www.example.com",
+      canonicalName: "origin.example.net",
+      records: [{ name: "origin.example.net", type: "A", value: "192.0.2.25", ttl: 300 }],
+    }));
   });
 
   it("converts PTR address input before resolving", async () => {

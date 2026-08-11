@@ -48,7 +48,7 @@ import type {
 
 const EXAMPLE_DOMAINS = ["google.com", "github.com", "cloudflare.com"];
 
-const COMMON_DNS_LOOKUP_TYPES: DnsLookupType[] = [
+export const DNS_LOOKUP_TYPES: readonly DnsLookupType[] = [
   "A",
   "AAAA",
   "MX",
@@ -61,6 +61,8 @@ const COMMON_DNS_LOOKUP_TYPES: DnsLookupType[] = [
   "PTR",
 ];
 
+const DNS_LOOKUP_TYPE_SET = new Set<string>(DNS_LOOKUP_TYPES);
+
 const DNS_LOOKUP_HINTS: Partial<Record<DnsLookupType, string>> = {
   TXT: "Use the exact owner name, such as selector._domainkey.example.com for a DKIM key.",
   CNAME: "Use the alias owner name, such as www.example.com.",
@@ -68,26 +70,194 @@ const DNS_LOOKUP_HINTS: Partial<Record<DnsLookupType, string>> = {
   PTR: "Enter an IPv4 or IPv6 address; the server converts it to the reverse-DNS owner name.",
 };
 
-function isScanResult(value: unknown): value is ScanResult {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Partial<ScanResult>;
+const DNS_LOOKUP_GUIDANCE: Record<DnsLookupType, { present: string; empty: string }> = {
+  A: {
+    present: "Confirm each address belongs to the intended web, application, or edge provider before changing it.",
+    empty: "Only add an A record if this exact name needs IPv4 service; use the address supplied by the hosting provider.",
+  },
+  AAAA: {
+    present: "Confirm IPv6 is intentionally enabled and the service is reachable and secured over every returned address.",
+    empty: "AAAA is optional. Add it only when the service and network are ready to accept IPv6 traffic.",
+  },
+  MX: {
+    present: "Compare priorities and hosts with the mail provider. A lone 0 . intentionally disables inbound mail.",
+    empty: "If the domain receives mail, publish the provider's exact MX set; otherwise consider one explicit null MX (0 .).",
+  },
+  NS: {
+    present: "At a delegated zone, compare this set with the registrar and DNS provider; ordinary hostnames may inherit authority.",
+    empty: "No direct NS is normal for a hostname. Investigate only if this exact name should be a separately delegated zone.",
+  },
+  TXT: {
+    present: "Review each value independently. Keep one SPF policy and one DMARC policy at their required owner names.",
+    empty: "Verify the exact owner name first; TXT records are often published at prefixes such as _dmarc or selector._domainkey.",
+  },
+  CNAME: {
+    present: "Confirm the canonical target is current and resolves to the terminal service records expected by the provider.",
+    empty: "CNAME is optional. Do not add one where the same owner must retain independent MX, TXT, or other record data.",
+  },
+  SOA: {
+    present: "At the zone apex, confirm the primary server and serial are consistent across the authoritative nameservers.",
+    empty: "No direct SOA is normal for a hostname. Inspect the containing zone apex before treating this as a fault.",
+  },
+  CAA: {
+    present: "Confirm every authorized certificate authority is intentional; restrictive CAA can block certificate renewal.",
+    empty: "CAA is optional and may be inherited. Add it only after identifying every CA used for current and automated certificates.",
+  },
+  SRV: {
+    present: "Compare priority, weight, port, and target with the application's service-discovery configuration.",
+    empty: "SRV is service-specific. Publish only the exact _service._protocol owner and values required by that application.",
+  },
+  PTR: {
+    present: "Confirm the reverse name resolves forward to the same address when the service depends on forward-confirmed reverse DNS.",
+    empty: "PTR is controlled by the IP-address provider, not ordinary domain DNS; request the change from the ISP or hosting provider.",
+  },
+};
+
+const CHECK_STATUS_SET = new Set(["pass", "warning", "fail", "info", "unknown"]);
+const FINDING_SEVERITY_SET = new Set(["critical", "warning", "success", "info"]);
+const SCAN_GRADE_SET = new Set(["A", "B", "C", "D", "F"]);
+const SCAN_POSTURE_SET = new Set(["reject", "quarantine", "monitoring", "missing", "invalid"]);
+
+export function isScanResult(value: unknown): value is ScanResult {
+  if (!isObjectRecord(value)) return false;
+  const checks = value.checks;
+  const metadata = value.metadata;
+
   return (
-    typeof candidate.domain === "string" &&
-    typeof candidate.scannedAt === "string" &&
-    typeof candidate.durationMs === "number" &&
-    typeof candidate.score === "number" &&
-    typeof candidate.grade === "string" &&
-    typeof candidate.posture === "string" &&
-    Boolean(
-      candidate.checks?.dmarc &&
-      candidate.checks?.spf &&
-      candidate.checks?.dkim &&
-      candidate.checks?.transport &&
-      candidate.checks?.dns,
-    ) &&
-    Array.isArray(candidate.findings) &&
-    Boolean(candidate.metadata)
+    isBoundedString(value.domain, 253) &&
+    isIsoDate(value.scannedAt) &&
+    isFiniteNonnegative(value.durationMs) &&
+    typeof value.score === "number" &&
+    Number.isInteger(value.score) &&
+    value.score >= 0 &&
+    value.score <= 100 &&
+    typeof value.grade === "string" &&
+    SCAN_GRADE_SET.has(value.grade) &&
+    typeof value.posture === "string" &&
+    SCAN_POSTURE_SET.has(value.posture) &&
+    isBoundedString(value.postureLabel, 256) &&
+    isBoundedString(value.headline, 1_024) &&
+    isBoundedString(value.summary, 4_096) &&
+    isObjectRecord(checks) &&
+    isCheckResult(checks.dmarc) &&
+    isCheckResult(checks.spf) &&
+    isCheckResult(checks.dkim) &&
+    isCheckResult(checks.transport) &&
+    isCheckResult(checks.dns) &&
+    Array.isArray(value.dkimSelectors) &&
+    value.dkimSelectors.length <= 64 &&
+    value.dkimSelectors.every(isDkimSelectorResult) &&
+    Array.isArray(value.findings) &&
+    value.findings.length <= 256 &&
+    value.findings.every(isFinding) &&
+    isObjectRecord(metadata) &&
+    isBoundedStringArray(metadata.mxProviders, 256, 253) &&
+    isBoundedStringArray(metadata.nameservers, 256, 253) &&
+    typeof metadata.hasBimi === "boolean" &&
+    typeof metadata.hasMtaSts === "boolean" &&
+    typeof metadata.hasTlsRpt === "boolean" &&
+    isBoundedString(value.disclaimer, 8_192)
   );
+}
+
+function isCheckResult(value: unknown): value is CheckResult {
+  if (!isObjectRecord(value)) return false;
+  return (
+    typeof value.status === "string" &&
+    CHECK_STATUS_SET.has(value.status) &&
+    isBoundedString(value.title, 512) &&
+    isBoundedString(value.summary, 4_096) &&
+    Array.isArray(value.details) &&
+    value.details.length <= 128 &&
+    value.details.every((detail) => (
+      isObjectRecord(detail) &&
+      isBoundedString(detail.label, 512) &&
+      isBoundedString(detail.value, 8_192, true)
+    )) &&
+    Array.isArray(value.records) &&
+    value.records.length <= 256 &&
+    value.records.every(isDnsRecordView)
+  );
+}
+
+function isDnsRecordView(value: unknown): boolean {
+  if (!isObjectRecord(value)) return false;
+  return (
+    isBoundedString(value.name, 253) &&
+    isBoundedString(value.type, 32) &&
+    isBoundedString(value.value, 262_144, true) &&
+    (
+      value.ttl === undefined ||
+      (typeof value.ttl === "number" && Number.isInteger(value.ttl) && value.ttl >= 0 && value.ttl <= 2 ** 32 - 1)
+    )
+  );
+}
+
+function isFinding(value: unknown): boolean {
+  if (!isObjectRecord(value)) return false;
+  return (
+    isBoundedString(value.id, 256) &&
+    typeof value.severity === "string" &&
+    FINDING_SEVERITY_SET.has(value.severity) &&
+    isBoundedString(value.title, 1_024) &&
+    isBoundedString(value.detail, 8_192) &&
+    (value.action === undefined || isBoundedString(value.action, 8_192)) &&
+    (value.remediation === undefined || isRemediation(value.remediation))
+  );
+}
+
+function isRemediation(value: unknown): boolean {
+  if (!isObjectRecord(value)) return false;
+  const record = value.record;
+  return (
+    isBoundedString(value.summary, 8_192) &&
+    isBoundedStringArray(value.steps, 32, 8_192) &&
+    (value.caution === undefined || isBoundedString(value.caution, 8_192)) &&
+    (
+      record === undefined ||
+      (
+        isObjectRecord(record) &&
+        isBoundedString(record.name, 253) &&
+        isBoundedString(record.type, 32) &&
+        isBoundedString(record.value, 262_144, true)
+      )
+    )
+  );
+}
+
+function isDkimSelectorResult(value: unknown): boolean {
+  if (!isObjectRecord(value)) return false;
+  return (
+    isBoundedString(value.selector, 63) &&
+    typeof value.found === "boolean" &&
+    (value.kind === undefined || value.kind === "TXT" || value.kind === "CNAME") &&
+    (value.value === undefined || isBoundedString(value.value, 262_144, true)) &&
+    (
+      value.issue === undefined ||
+      value.issue === "revoked" ||
+      value.issue === "unresolved-alias"
+    )
+  );
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isBoundedString(value: unknown, maxLength: number, allowEmpty = false): value is string {
+  return typeof value === "string" && (allowEmpty || value.length > 0) && value.length <= maxLength;
+}
+
+function isBoundedStringArray(value: unknown, maxItems: number, maxLength: number): value is string[] {
+  return Array.isArray(value) && value.length <= maxItems && value.every((item) => isBoundedString(item, maxLength));
+}
+
+function isFiniteNonnegative(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isIsoDate(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 64 && !Number.isNaN(Date.parse(value));
 }
 
 function isScanError(value: unknown): value is ScanError {
@@ -96,23 +266,62 @@ function isScanError(value: unknown): value is ScanError {
   return typeof candidate.error === "string" && typeof candidate.code === "string";
 }
 
-function isDnsLookupResult(value: unknown): value is DnsLookupResult {
+export function isDnsLookupResult(value: unknown, expectedType?: DnsLookupType): value is DnsLookupResult {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<DnsLookupResult>;
   return (
     typeof candidate.input === "string" &&
+    candidate.input.length > 0 &&
+    candidate.input.length <= 512 &&
     typeof candidate.queryName === "string" &&
+    candidate.queryName.length > 0 &&
+    candidate.queryName.length <= 253 &&
+    (
+      candidate.canonicalName === undefined ||
+      (
+        typeof candidate.canonicalName === "string" &&
+        candidate.canonicalName.length > 0 &&
+        candidate.canonicalName.length <= 253
+      )
+    ) &&
     typeof candidate.type === "string" &&
+    DNS_LOOKUP_TYPE_SET.has(candidate.type) &&
+    (expectedType === undefined || candidate.type === expectedType) &&
     typeof candidate.scannedAt === "string" &&
+    !Number.isNaN(Date.parse(candidate.scannedAt)) &&
     typeof candidate.durationMs === "number" &&
+    Number.isFinite(candidate.durationMs) &&
+    candidate.durationMs >= 0 &&
     typeof candidate.summary === "string" &&
-    Array.isArray(candidate.records)
+    candidate.summary.length > 0 &&
+    candidate.summary.length <= 2_048 &&
+    Array.isArray(candidate.records) &&
+    candidate.records.length <= 256 &&
+    candidate.records.every((record) => (
+      Boolean(record) &&
+      typeof record === "object" &&
+      typeof record.name === "string" &&
+      record.name.length > 0 &&
+      record.name.length <= 253 &&
+      record.type === candidate.type &&
+      typeof record.value === "string" &&
+      record.value.length <= 262_144 &&
+      (
+        record.ttl === undefined ||
+        (
+          typeof record.ttl === "number" &&
+          Number.isInteger(record.ttl) &&
+          record.ttl >= 0 &&
+          record.ttl <= 2 ** 32 - 1
+        )
+      )
+    ))
   );
 }
 
 function dnsLookupExample(type: DnsLookupType, suggestedDomain: string): string {
   const domain = suggestedDomain || "example.com";
-  if (type === "PTR") return "192.0.2.25";
+  if (type === "PTR") return "8.8.8.8";
   if (type === "TXT") return `selector._domainkey.${domain}`;
   if (type === "CNAME") return `www.${domain}`;
   if (type === "SRV") return `_sip._tcp.${domain}`;
@@ -125,6 +334,13 @@ function suggestedDnsLookupInput(type: DnsLookupType, suggestedDomain: string): 
     return dnsLookupExample(type, suggestedDomain);
   }
   return suggestedDomain;
+}
+
+function canPreserveLookupInput(value: string, currentType: DnsLookupType, nextType: DnsLookupType): boolean {
+  if (!value) return false;
+  if (currentType === "PTR" && nextType !== "PTR") return false;
+  if (nextType !== "PTR") return true;
+  return /^(?:\d{1,3}\.){3}\d{1,3}$/u.test(value) || value.includes(":") || /\.(?:in-addr|ip6)\.arpa\.?$/iu.test(value);
 }
 
 const statusIcons: Record<CheckStatus, ReactNode> = {
@@ -699,7 +915,7 @@ function Results({
   );
 }
 
-function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
+export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
   const [lookupType, setLookupType] = useState<DnsLookupType>("A");
   const [lookupInput, setLookupInput] = useState("");
   const [hasEditedInput, setHasEditedInput] = useState(false);
@@ -709,31 +925,58 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
   const [copiedRecord, setCopiedRecord] = useState<string | null>(null);
   const [copyMessage, setCopyMessage] = useState("");
   const lookupControllerRef = useRef<AbortController | null>(null);
+  const lookupRequestVersionRef = useRef(0);
 
   const cleanSuggestedDomain = suggestedDomain.trim();
   const example = dnsLookupExample(lookupType, cleanSuggestedDomain);
   const hint = DNS_LOOKUP_HINTS[lookupType] ?? "Enter the exact public DNS owner name you want to query.";
 
   useEffect(() => {
+    lookupRequestVersionRef.current += 1;
+    lookupControllerRef.current?.abort();
+    lookupControllerRef.current = null;
+    setLookupLoading(false);
+    setLookupResult(null);
+    setLookupError(null);
+    setCopiedRecord(null);
+    setCopyMessage("");
     if (!hasEditedInput && cleanSuggestedDomain) {
       setLookupInput(suggestedDnsLookupInput(lookupType, cleanSuggestedDomain));
     }
-  }, [cleanSuggestedDomain, hasEditedInput, lookupType]);
+  }, [cleanSuggestedDomain]);
 
-  useEffect(() => () => lookupControllerRef.current?.abort(), []);
+  useEffect(() => () => {
+    lookupRequestVersionRef.current += 1;
+    lookupControllerRef.current?.abort();
+  }, []);
 
   function handleLookupTypeChange(nextType: DnsLookupType) {
+    lookupRequestVersionRef.current += 1;
+    lookupControllerRef.current?.abort();
+    lookupControllerRef.current = null;
+    const currentInput = lookupInput.trim();
+    const preserveCustomInput = hasEditedInput && canPreserveLookupInput(currentInput, lookupType, nextType);
     setLookupType(nextType);
+    setLookupInput(preserveCustomInput ? lookupInput : suggestedDnsLookupInput(nextType, cleanSuggestedDomain));
+    setHasEditedInput(preserveCustomInput);
+    setLookupLoading(false);
+    setLookupResult(null);
     setLookupError(null);
-    if (!hasEditedInput) {
-      setLookupInput(suggestedDnsLookupInput(nextType, cleanSuggestedDomain));
-    }
+    setCopiedRecord(null);
+    setCopyMessage("");
   }
 
   function useLookupValue(value: string) {
+    lookupRequestVersionRef.current += 1;
+    lookupControllerRef.current?.abort();
+    lookupControllerRef.current = null;
     setLookupInput(value);
     setHasEditedInput(true);
+    setLookupLoading(false);
+    setLookupResult(null);
     setLookupError(null);
+    setCopiedRecord(null);
+    setCopyMessage("");
     document.getElementById("dns-lookup-name")?.focus();
   }
 
@@ -759,6 +1002,8 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
     lookupControllerRef.current?.abort();
     const controller = new AbortController();
     lookupControllerRef.current = controller;
+    const requestVersion = lookupRequestVersionRef.current + 1;
+    lookupRequestVersionRef.current = requestVersion;
     const requestedType = lookupType;
     const timeout = window.setTimeout(() => controller.abort(), 15_000);
     setLookupLoading(true);
@@ -789,14 +1034,14 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
       if (!response.ok || isScanError(payload)) {
         throw new Error(isScanError(payload) ? payload.error : "The DNS lookup could not be completed.");
       }
-      if (!isDnsLookupResult(payload)) {
+      if (!isDnsLookupResult(payload, requestedType)) {
         throw new Error("The DNS lookup API returned an incomplete response. Please try again.");
       }
 
-      if (lookupControllerRef.current !== controller) return;
+      if (lookupRequestVersionRef.current !== requestVersion || lookupControllerRef.current !== controller) return;
       setLookupResult(payload);
     } catch (error) {
-      if (lookupControllerRef.current !== controller) return;
+      if (lookupRequestVersionRef.current !== requestVersion || lookupControllerRef.current !== controller) return;
       setLookupError(
         error instanceof DOMException && error.name === "AbortError"
           ? "The DNS lookup timed out. No absence was inferred; please try again."
@@ -806,7 +1051,10 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
       );
     } finally {
       window.clearTimeout(timeout);
-      if (lookupControllerRef.current === controller) setLookupLoading(false);
+      if (lookupRequestVersionRef.current === requestVersion && lookupControllerRef.current === controller) {
+        lookupControllerRef.current = null;
+        setLookupLoading(false);
+      }
     }
   }
 
@@ -826,7 +1074,7 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
       <div className="container">
         <div className="dns-explorer-heading">
           <div>
-            <div className="eyebrow"><span /> Advanced DNS explorer</div>
+            <div className="eyebrow"><span /> DNS record explorer</div>
             <h2 id="dns-explorer-title">Inspect the record behind the result.</h2>
           </div>
           <p>
@@ -846,7 +1094,7 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
                 disabled={lookupLoading}
               >
                 <optgroup label="DNS record types">
-                  {COMMON_DNS_LOOKUP_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
+                  {DNS_LOOKUP_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
                 </optgroup>
               </select>
             </div>
@@ -867,7 +1115,10 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
                   onChange={(event) => {
                     setLookupInput(event.target.value);
                     setHasEditedInput(true);
+                    setLookupResult(null);
                     setLookupError(null);
+                    setCopiedRecord(null);
+                    setCopyMessage("");
                   }}
                   placeholder={example}
                   aria-describedby="dns-lookup-help dns-lookup-scope"
@@ -885,7 +1136,7 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
           <div className="dns-lookup-help" id="dns-lookup-help">
             <p>{hint}</p>
             <div className="dns-lookup-shortcuts" aria-label="Lookup input shortcuts">
-              <span>Example</span>
+              <span>Format example</span>
               <button type="button" onClick={() => useLookupValue(example)} disabled={lookupLoading}>
                 <code>{example}</code>
               </button>
@@ -912,7 +1163,7 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
           )}
 
           {lookupResult && !lookupLoading && (
-            <div className="dns-lookup-result" aria-live="polite">
+            <div className="dns-lookup-result">
               <div className="dns-result-heading">
                 <span className="dns-type-badge">{lookupResult.type}</span>
                 <div>
@@ -923,11 +1174,16 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
                   {records.length} answer{records.length === 1 ? "" : "s"} · {(lookupResult.durationMs / 1000).toFixed(2)}s
                 </span>
               </div>
-              <p className="dns-result-summary">{lookupResult.summary}</p>
-              {lookupResult.input !== lookupResult.queryName && (
+              <p className="dns-result-summary" role="status" aria-live="polite">{lookupResult.summary}</p>
+              {(lookupResult.input !== lookupResult.queryName || lookupResult.canonicalName) && (
                 <div className="dns-query-translation">
-                  <span>Entered</span><code>{lookupResult.input}</code><ChevronRight aria-hidden="true" />
-                  <span>Queried</span><code>{lookupResult.queryName}</code>
+                  <span>Entered</span><code>{lookupResult.input}</code>
+                  {lookupResult.input !== lookupResult.queryName && (
+                    <><ChevronRight aria-hidden="true" /><span>Queried</span><code>{lookupResult.queryName}</code></>
+                  )}
+                  {lookupResult.canonicalName && (
+                    <><ChevronRight aria-hidden="true" /><span>Canonical target</span><code>{lookupResult.canonicalName}</code></>
+                  )}
                 </div>
               )}
 
@@ -963,9 +1219,18 @@ function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: string }) {
                       </article>
                     );
                   })}
-                  <span className="sr-only" aria-live="polite">{copyMessage}</span>
+                  {copyMessage && (
+                    <span className="dns-copy-message" aria-live="polite">{copyMessage}</span>
+                  )}
                 </div>
               )}
+              <div className="dns-result-guidance">
+                <Info aria-hidden="true" />
+                <div>
+                  <strong>{records.length > 0 ? "How to validate this answer" : "What to check before changing DNS"}</strong>
+                  <span>{records.length > 0 ? DNS_LOOKUP_GUIDANCE[lookupResult.type].present : DNS_LOOKUP_GUIDANCE[lookupResult.type].empty}</span>
+                </div>
+              </div>
             </div>
           )}
         </div>

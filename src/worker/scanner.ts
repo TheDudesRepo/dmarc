@@ -9,7 +9,7 @@ import { type DmarcPolicy, type ParsedDmarcRecord, findDmarcRecords, parseDmarcR
 import { DnsClient, DnsQueryError, type DnsAnswer, type DnsQueryType, toRecordViews } from "./dns";
 import { estimateSpfLookups, findSpfRecords, parseSpfRecord, type SpfLookupEstimate } from "./spf";
 
-const COMMON_DKIM_SELECTORS = ["selector1", "selector2", "google", "default", "k1", "k2", "s1", "s2", "dkim", "mail"] as const;
+const COMMON_DKIM_SELECTORS = ["selector1", "selector2", "google", "default", "k1", "k2", "s1", "s2"] as const;
 
 const DISCLAIMER =
   "This is a point-in-time DNS configuration snapshot, not proof of deliverability or enforcement readiness. DNS alone cannot inventory legitimate senders, observe real SPF/DKIM alignment, verify every DKIM selector, validate external DMARC reporting authorization, or reliably calculate organizational-domain inheritance for every public suffix. Review DMARC aggregate reports and test mail flows before changing policy.";
@@ -233,26 +233,22 @@ function analyzeDnsHealth({
 }): DnsHealthAnalysis {
   const findings: Finding[] = [];
   const unavailable = [rootTxt, a, aaaa, mx, ns, cname, soa, caa].filter((result) => result.failed).length;
-  const aliasOwners = new Set(cname.answers.map((answer) => answer.name.toLowerCase().replace(/\.$/u, "")));
-  const hasConflictingAlias = aliasOwners.size > 0 && [...rootTxt.answers, ...mx.answers].some((answer) =>
-    aliasOwners.has(answer.name.toLowerCase().replace(/\.$/u, "")),
-  );
 
   if (!ns.failed && ns.answers.length === 0) {
     findings.push({
       id: "dns-nameservers-not-found",
-      severity: "critical",
-      title: "No authoritative nameservers were returned",
-      detail: "The NS lookup completed without returning a nameserver. A public delegated zone normally requires authoritative NS records.",
-      action: "Confirm registrar delegation and restore the DNS provider's authoritative nameservers.",
+      severity: "info",
+      title: "No direct NS record at the scanned name",
+      detail: "This is normal for many hostnames and subdomains. If the scanned name is intended to be a separately delegated zone apex, it should normally return authoritative NS records.",
+      action: "Only investigate registrar or delegation settings if this exact name is intended to be a DNS zone apex.",
       remediation: {
-        summary: "Restore a valid delegation between the registrar and authoritative DNS provider.",
+        summary: "Confirm whether this exact name is a hostname or a delegated zone before changing DNS.",
         steps: [
-          "Open the registrar's nameserver settings and compare them with the active DNS provider's assigned NS hostnames.",
-          "Replace stale or missing delegation values and confirm the zone exists at the provider.",
-          "Wait for parent-zone TTLs to expire, then verify NS and SOA responses from multiple networks.",
+          "Determine the registered or delegated zone that contains this name; an ordinary subdomain inherits its parent zone's authority.",
+          "If this exact name should be delegated, compare its parent-side NS records with the DNS provider's assigned nameservers.",
+          "Verify the intended zone's NS and SOA responses before making registrar changes.",
         ],
-        caution: "Changing delegation can take the entire domain offline. Copy the exact nameservers assigned by the active provider.",
+        caution: "Do not add NS records or change registrar delegation merely because an ordinary hostname has no direct NS answer.",
       },
     });
   } else if (!ns.failed && ns.answers.length === 1) {
@@ -276,37 +272,18 @@ function analyzeDnsHealth({
   if (!soa.failed && soa.answers.length === 0) {
     findings.push({
       id: "dns-soa-not-found",
-      severity: "warning",
-      title: "No SOA record was returned",
-      detail: "The SOA lookup completed without the zone authority metadata expected for a delegated DNS zone.",
-      action: "Confirm the zone exists and is authoritative at the delegated DNS provider.",
+      severity: "info",
+      title: "No direct SOA record at the scanned name",
+      detail: "An ordinary hostname or subdomain does not publish its own SOA. This matters only when the exact scanned name is intended to be a separate DNS zone apex.",
+      action: "Confirm the containing zone rather than assuming this hostname needs its own SOA.",
       remediation: {
-        summary: "Restore the zone's Start of Authority through the authoritative DNS provider.",
+        summary: "Verify zone ownership before treating a missing direct SOA answer as a fault.",
         steps: [
-          "Confirm the domain is delegated to the intended provider and the DNS zone is active there.",
-          "Check that the provider publishes a valid SOA with a current serial and responsible mailbox.",
-          "Correct delegation or zone provisioning, then compare SOA answers across every authoritative server.",
+          "Identify the parent zone responsible for this hostname and inspect that zone's SOA.",
+          "If this exact name should be a separate zone, confirm its delegation and provisioning at the intended provider.",
+          "Compare the actual zone apex's SOA across its authoritative nameservers.",
         ],
-        caution: "Most managed DNS services create SOA automatically; do not hand-edit it unless the platform explicitly requires that workflow.",
-      },
-    });
-  }
-
-  if (hasConflictingAlias) {
-    findings.push({
-      id: "dns-cname-data-conflict",
-      severity: "critical",
-      title: "CNAME conflicts with other records at the same name",
-      detail: "A CNAME answer was returned while TXT or MX data also exists at the scanned name. Standard DNS does not allow a CNAME to coexist with other record data at one owner name.",
-      action: "Remove the alias or replace it with a provider-supported apex ALIAS/ANAME/flattening record.",
-      remediation: {
-        summary: "Choose one owner-name model: an alias, or independent records—not both.",
-        steps: [
-          "Identify which service added the CNAME and which existing TXT/MX records must remain.",
-          "For an apex domain, use the DNS provider's supported ALIAS, ANAME, or CNAME-flattening feature instead of a literal CNAME.",
-          "Remove the conflicting value, wait for its TTL, and verify CNAME, MX, and TXT again.",
-        ],
-        caution: "Removing MX or verification TXT records can interrupt mail or vendor ownership checks. Preserve required data during the change.",
+        caution: "Most managed DNS services create SOA automatically. Do not hand-create one for a normal hostname.",
       },
     });
   }
@@ -337,7 +314,7 @@ function analyzeDnsHealth({
         { label: "Nameservers (NS)", value: dnsResultLabel(ns) },
         { label: "Text (TXT)", value: dnsResultLabel(rootTxt) },
         { label: "Zone authority (SOA)", value: dnsResultLabel(soa) },
-        { label: "Certificate authorities (CAA)", value: caa.failed ? "Unknown" : caa.answers.length > 0 ? `${caa.answers.length} record(s)` : "Not restricted (optional)" },
+        { label: "Certificate authorities (CAA)", value: caa.failed ? "Unknown" : caa.answers.length > 0 ? `${caa.answers.length} direct record(s)` : "No direct record (may inherit)" },
       ],
       records: toRecordViews([
         ...a.answers,
@@ -783,7 +760,7 @@ function analyzeSpf(rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | un
   }
 
   const lookupLabel = estimate
-    ? `${estimate.truncated ? "At least " : ""}${estimate.count}${estimate.exceedsLimit ? " (over the RFC limit of 10)" : ""}`
+    ? `${estimate.truncated || estimate.issues.length > 0 ? "At least " : ""}${estimate.count}${estimate.exceedsLimit ? " (over the RFC limit of 10)" : ""}`
     : "Not calculated";
   const dangerousAll = parsed.terminalAll === "+";
   const lookupWarning = Boolean(estimate?.exceedsLimit || estimate?.truncated || estimate?.issues.length);
@@ -867,6 +844,44 @@ function analyzeSpf(rootTxt: OptionalDnsResult, estimate: SpfLookupEstimate | un
 function analyzeDkim(discovery: DkimDiscoveryResult): { check: CheckResult; points: number; findings: Finding[] } {
   const { selectors, failedQueries } = discovery;
   const found = selectors.filter((selector) => selector.found);
+  const revoked = selectors.filter((selector) => selector.issue === "revoked");
+  const unresolvedAliases = selectors.filter((selector) => selector.issue === "unresolved-alias");
+  const issueRecords = [...revoked, ...unresolvedAliases].flatMap((selector) =>
+    selector.value
+      ? [{ name: `${selector.selector}._domainkey`, type: selector.kind ?? "TXT", value: selector.value }]
+      : [],
+  );
+  const issueFindings: Finding[] = [];
+
+  if (unresolvedAliases.length > 0) {
+    issueFindings.push({
+      id: "dkim-alias-unresolved",
+      severity: "warning",
+      title: "DKIM selector alias did not resolve to an active key",
+      detail: `${unresolvedAliases.map((selector) => selector.selector).join(", ")} published a CNAME, but the terminal target did not return a non-empty DKIM public key during this scan.`,
+      action: "Compare the alias target with the sending provider's current DKIM hostname and remove stale selectors only after confirming they are no longer used.",
+      remediation: {
+        summary: "Repair the provider-supplied DKIM delegation or retire the stale selector.",
+        steps: [
+          "Confirm the selector and target shown in DNS match the active mail provider's setup instructions.",
+          "Query the canonical target for its terminal TXT key and check the provider's DKIM status page.",
+          "Correct the CNAME target or re-enable DKIM at the provider, then send a signed test message before removing any old selector.",
+        ],
+        caution: "A CNAME by itself is not an active DKIM key. Removing a selector still used for signing can break DKIM validation.",
+      },
+    });
+  }
+
+  if (revoked.length > 0) {
+    issueFindings.push({
+      id: "dkim-key-revoked",
+      severity: "info",
+      title: "Revoked DKIM selector observed",
+      detail: `${revoked.map((selector) => selector.selector).join(", ")} returned an empty p= value, which marks that key as revoked rather than active.`,
+      action: "Confirm the selector is intentionally retired and that active senders use a different published key.",
+    });
+  }
+
   if (found.length === 0) {
     return {
       points: 0,
@@ -880,8 +895,10 @@ function analyzeDkim(discovery: DkimDiscoveryResult): { check: CheckResult; poin
         details: [
           { label: "Selectors tested", value: String(selectors.length) },
           { label: "Unavailable DNS queries", value: String(failedQueries) },
+          ...(unresolvedAliases.length > 0 ? [{ label: "Unresolved selector aliases", value: unresolvedAliases.map((selector) => selector.selector).join(", ") }] : []),
+          ...(revoked.length > 0 ? [{ label: "Revoked selectors", value: revoked.map((selector) => selector.selector).join(", ") }] : []),
         ],
-        records: [],
+        records: issueRecords,
       },
       findings: [
         {
@@ -900,6 +917,7 @@ function analyzeDkim(discovery: DkimDiscoveryResult): { check: CheckResult; poin
             caution: "Selectors are not enumerable. Do not assume DKIM is missing merely because common names were not found.",
           },
         },
+        ...issueFindings,
       ],
     };
   }
@@ -907,19 +925,24 @@ function analyzeDkim(discovery: DkimDiscoveryResult): { check: CheckResult; poin
   return {
     points: 12,
     check: {
-      status: "pass",
+      status: unresolvedAliases.length > 0 ? "warning" : "pass",
       title: "DKIM discovery",
       summary: `${found.length} common ${found.length === 1 ? "selector was" : "selectors were"} discovered; message signing and alignment remain unverified.`,
       details: [
         { label: "Discovered", value: found.map((selector) => selector.selector).join(", ") },
         { label: "Scope", value: "Common-selector DNS discovery only" },
         ...(failedQueries > 0 ? [{ label: "Unavailable DNS queries", value: String(failedQueries) }] : []),
+        ...(unresolvedAliases.length > 0 ? [{ label: "Unresolved selector aliases", value: unresolvedAliases.map((selector) => selector.selector).join(", ") }] : []),
+        ...(revoked.length > 0 ? [{ label: "Revoked selectors", value: revoked.map((selector) => selector.selector).join(", ") }] : []),
       ],
-      records: found.flatMap((selector) =>
-        selector.value
-          ? [{ name: `${selector.selector}._domainkey`, type: selector.kind ?? "TXT", value: selector.value }]
-          : [],
-      ),
+      records: [
+        ...found.flatMap((selector) =>
+          selector.value
+            ? [{ name: `${selector.selector}._domainkey`, type: selector.kind ?? "TXT", value: selector.value }]
+            : [],
+        ),
+        ...issueRecords,
+      ],
     },
     findings: [
       {
@@ -928,6 +951,7 @@ function analyzeDkim(discovery: DkimDiscoveryResult): { check: CheckResult; poin
         title: "Common DKIM selector discovered",
         detail: `${found.map((selector) => selector.selector).join(", ")} returned DKIM-like DNS data. This does not verify live signing, cryptographic validity, or From-domain alignment.`,
       },
+      ...issueFindings,
     ],
   };
 }
@@ -939,7 +963,9 @@ function analyzeTransport(
   tlsRpt: OptionalDnsResult,
 ): { check: CheckResult; points: number; findings: Finding[] } {
   const hasMx = mx.answers.length > 0;
-  const hasNullMx = mx.answers.some((answer) => /^\s*0\s+\.\s*$/u.test(answer.data));
+  const nullMxAnswers = mx.answers.filter((answer) => /^\s*\d+\s+\.\s*$/u.test(answer.data));
+  const hasNullMx = mx.answers.length === 1 && /^\s*0\s+\.\s*$/u.test(mx.answers[0]?.data ?? "");
+  const hasInvalidNullMx = nullMxAnswers.length > 0 && !hasNullMx;
   const receivesMail = hasMx && !hasNullMx;
   const hasMtaSts = hasVersionRecord(mtaSts.answers, "STSv1");
   const hasTlsRpt = hasVersionRecord(tlsRpt.answers, "TLSRPTv1");
@@ -966,6 +992,24 @@ function analyzeTransport(
           value: "0 .",
         },
         caution: "A null MX deliberately prevents inbound delivery. Do not publish it on a domain that should receive email.",
+      },
+    });
+  }
+  if (!mx.failed && hasInvalidNullMx) {
+    findings.push({
+      id: "invalid-null-mx",
+      severity: "critical",
+      title: "Null MX is mixed with other mail routes",
+      detail: "A valid null MX must be the domain's only MX record and must use preference 0 with target '.'. Mixing it with real exchangers, or using another preference, makes the inbound-mail intent invalid or ambiguous.",
+      action: "Choose whether this domain receives mail, then publish either only 0 . or only the real provider MX records.",
+      remediation: {
+        summary: "Replace the contradictory MX set with one deliberate inbound-mail configuration.",
+        steps: [
+          "Confirm with the domain owner whether the domain should accept inbound email.",
+          "If it receives mail, remove every MX whose target is '.' and keep only the exact provider-supplied exchangers and priorities.",
+          "If it never receives mail, remove every real exchanger and publish one MX record with preference 0 and target '.'.",
+        ],
+        caution: "Removing active provider MX records interrupts inbound delivery. Confirm the intended mail service before changing DNS.",
       },
     });
   }
@@ -1035,20 +1079,28 @@ function analyzeTransport(
   }
 
   const unavailable = mx.failed || mtaSts.failed || tlsRpt.failed;
+  const mtaStsSummary = hasMtaSts ? "found" : mtaSts.failed ? "unavailable" : "not found";
+  const tlsRptSummary = hasTlsRpt ? "found" : tlsRpt.failed ? "unavailable" : "not found";
   return {
     points,
     check: {
-      status: unavailable ? "unknown" : hasMtaSts && hasTlsRpt ? "pass" : "info",
+      status: hasInvalidNullMx ? "fail" : unavailable ? "unknown" : hasMtaSts && hasTlsRpt ? "pass" : "info",
       title: "Mail transport",
-      summary: unavailable
-        ? "One or more transport DNS queries were unavailable."
-        : `MX ${hasNullMx ? "explicitly disabled (null MX)" : hasMx ? "found" : "not found"}; MTA-STS marker ${hasMtaSts ? "found" : "not found"}; TLS-RPT ${hasTlsRpt ? "found" : "not found"}.`,
+      summary: hasInvalidNullMx
+        ? `MX contains an invalid null-MX combination; MTA-STS marker ${mtaStsSummary}; TLS-RPT ${tlsRptSummary}.`
+        : unavailable
+          ? "One or more transport DNS queries were unavailable."
+          : `MX ${hasNullMx ? "explicitly disabled (null MX)" : hasMx ? "found" : "not found"}; MTA-STS marker ${mtaStsSummary}; TLS-RPT ${tlsRptSummary}.`,
       details: [
-        { label: "MX", value: hasNullMx ? "Null MX (inbound mail disabled)" : hasMx ? `${mx.answers.length} record(s)` : mx.failed ? "Unknown" : "Not found" },
+        { label: "MX", value: hasInvalidNullMx ? "Invalid null-MX combination" : hasNullMx ? "Null MX (inbound mail disabled)" : hasMx ? `${mx.answers.length} record(s)` : mx.failed ? "Unknown" : "Not found" },
         { label: "MTA-STS", value: hasMtaSts ? "DNS marker found; HTTPS policy not tested" : mtaSts.failed ? "Unknown" : "Not found" },
         { label: "TLS-RPT", value: hasTlsRpt ? "Record found" : tlsRpt.failed ? "Unknown" : "Not found" },
       ],
-      records: toRecordViews([...mx.answers, ...mtaSts.answers, ...tlsRpt.answers]),
+      records: toRecordViews([
+        ...mx.answers,
+        ...versionedAnswers(mtaSts.answers, "STSv1"),
+        ...versionedAnswers(tlsRpt.answers, "TLSRPTv1"),
+      ]),
     },
     findings,
   };
@@ -1064,11 +1116,27 @@ async function discoverDkim(domain: string, dns: DnsResolver): Promise<DkimDisco
         optionalDns(dns.query(name, "CNAME")),
       ]);
       const dkimTxt = txtResult.answers.find((answer) => looksLikeDkimKey(answer.data));
+      const revokedDkimTxt = txtResult.answers.find((answer) => isRevokedDkimKey(answer.data));
       const cname = cnameResult.answers[0];
       if (txtResult.failed) failedQueries += 1;
       if (cnameResult.failed) failedQueries += 1;
-      if (dkimTxt) return { selector, found: true, kind: "TXT", value: dkimTxt.data };
-      if (cname) return { selector, found: true, kind: "CNAME", value: cname.data };
+      if (dkimTxt) {
+        return cname
+          ? { selector, found: true, kind: "CNAME", value: cname.data }
+          : { selector, found: true, kind: "TXT", value: dkimTxt.data };
+      }
+      if (revokedDkimTxt) {
+        return {
+          selector,
+          found: false,
+          kind: cname ? "CNAME" : "TXT",
+          value: cname?.data ?? revokedDkimTxt.data,
+          issue: "revoked",
+        };
+      }
+      if (cname) {
+        return { selector, found: false, kind: "CNAME", value: cname.data, issue: "unresolved-alias" };
+      }
       return { selector, found: false };
     }),
   );
@@ -1076,18 +1144,35 @@ async function discoverDkim(domain: string, dns: DnsResolver): Promise<DkimDisco
 }
 
 function looksLikeDkimKey(value: string): boolean {
+  const tags = parseDkimTags(value);
+  const version = tags.get("v");
+  const publicKey = tags.get("p");
+  return publicKey !== undefined && publicKey.length > 0 && (!version || version.toUpperCase() === "DKIM1");
+}
+
+function isRevokedDkimKey(value: string): boolean {
+  const tags = parseDkimTags(value);
+  const version = tags.get("v");
+  return tags.get("p") === "" && (!version || version.toUpperCase() === "DKIM1");
+}
+
+function parseDkimTags(value: string): Map<string, string> {
   const tags = new Map<string, string>();
   for (const segment of value.split(";")) {
     const separator = segment.indexOf("=");
     if (separator < 1) continue;
     tags.set(segment.slice(0, separator).trim().toLowerCase(), segment.slice(separator + 1).trim());
   }
-  const version = tags.get("v");
-  return tags.has("p") && (!version || version.toUpperCase() === "DKIM1");
+  return tags;
 }
 
 function hasVersionRecord(result: DnsAnswer[], version: string): boolean {
-  return result.some((answer) => new RegExp(`^\\s*v\\s*=\\s*${version}(?:\\s*;|\\s*$)`, "iu").test(answer.data));
+  return versionedAnswers(result, version).length > 0;
+}
+
+function versionedAnswers(result: DnsAnswer[], version: string): DnsAnswer[] {
+  const pattern = new RegExp(`^\\s*v\\s*=\\s*${version}(?:\\s*;|\\s*$)`, "iu");
+  return result.filter((answer) => pattern.test(answer.data));
 }
 
 function parseMxHostname(value: string): string | undefined {

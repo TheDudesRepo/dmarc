@@ -1,5 +1,11 @@
 import type { DnsLookupResult, DnsLookupType } from "../shared/types";
-import { DnsClient, type DnsAnswer, type DnsQueryType, toRecordViews } from "./dns";
+import {
+  DnsClient,
+  type DnsAnswer,
+  type DnsFollowingResult,
+  type DnsQueryType,
+  toRecordViews,
+} from "./dns";
 
 const MAX_INPUT_LENGTH = 512;
 const MAX_DNS_NAME_LENGTH = 253;
@@ -34,6 +40,10 @@ const DNS_LOOKUP_TYPE_SET = new Set<string>(DNS_LOOKUP_TYPES);
 
 export interface LookupResolver {
   query(name: string, type: DnsQueryType): Promise<DnsAnswer[]>;
+  queryFollowingCname?(
+    name: string,
+    type: Exclude<DnsQueryType, "CNAME">,
+  ): Promise<DnsFollowingResult>;
 }
 
 export interface NormalizedLookupRequest {
@@ -74,21 +84,38 @@ export async function lookupDns(
   const startedAt = performance.now();
 
   let answers: DnsAnswer[];
+  let resolvedCanonicalName: string | undefined;
   try {
-    answers = await dns.query(request.queryName, request.type);
+    if (request.type !== "CNAME" && dns.queryFollowingCname) {
+      const result = await dns.queryFollowingCname(request.queryName, request.type);
+      answers = result.answers;
+      resolvedCanonicalName = result.canonicalName;
+    } else {
+      answers = await dns.query(request.queryName, request.type);
+    }
   } catch {
     throw new LookupUpstreamError("The DNS lookup could not be completed.");
   }
 
   const records = toRecordViews(answers);
+  const answerNames = [...new Set(records.map((record) => record.name.toLowerCase()))];
+  const inferredCanonicalName = answerNames.length === 1 ? answerNames[0] : undefined;
+  const canonicalName = (resolvedCanonicalName ?? inferredCanonicalName) !== request.queryName
+    ? resolvedCanonicalName ?? inferredCanonicalName
+    : undefined;
   const recordLabel = `${request.type} ${records.length === 1 ? "record" : "records"}`;
   const summary = records.length === 0
-    ? `No ${request.type} records were returned for ${request.queryName}.`
-    : `${records.length} ${recordLabel} returned for ${request.queryName}.`;
+    ? canonicalName
+      ? `No ${request.type} records were returned after following ${request.queryName} to ${canonicalName}.`
+      : `No ${request.type} records were returned for ${request.queryName}.`
+    : canonicalName
+      ? `${records.length} ${recordLabel} returned from canonical target ${canonicalName}.`
+      : `${records.length} ${recordLabel} returned for ${request.queryName}.`;
 
   return {
     input: request.input,
     queryName: request.queryName,
+    ...(canonicalName ? { canonicalName } : {}),
     type: request.type,
     scannedAt,
     durationMs: Math.max(1, Math.round(performance.now() - startedAt)),

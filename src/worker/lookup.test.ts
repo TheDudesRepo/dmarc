@@ -166,6 +166,23 @@ describe("lookupDns", () => {
     expect(result.summary).not.toMatch(/issue|error|broken|invalid/iu);
   });
 
+  it("reports the canonical target even when its terminal answer is empty", async () => {
+    const resolver: LookupResolver = {
+      query: async () => [],
+      queryFollowingCname: async () => ({
+        answers: [],
+        canonicalName: "target.example.net",
+        aliases: [{ name: "alias.example.com", type: "CNAME", data: "target.example.net" }],
+      }),
+    };
+
+    const result = await lookupDns("alias.example.com", "AAAA", resolver);
+
+    expect(result.canonicalName).toBe("target.example.net");
+    expect(result.records).toEqual([]);
+    expect(result.summary).toMatch(/following alias\.example\.com to target\.example\.net/u);
+  });
+
   it("maps resolver failures to a lookup upstream error", async () => {
     await expect(
       lookupDns("example.com", "A", new FakeResolver([], new DnsQueryError("SERVFAIL"))),

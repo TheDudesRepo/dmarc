@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { DnsQueryError, type DnsAnswer, type DnsQueryType } from "./dns";
+import {
+  DnsClient,
+  DnsQueryError,
+  type DnsAnswer,
+  type DnsQueryType,
+  type NativeDnsResolver,
+} from "./dns";
 import { scanDomain, ScanUpstreamError, type DnsResolver } from "./scanner";
 
 class FakeResolver implements DnsResolver {
@@ -27,6 +33,9 @@ describe("deterministic scan engine", () => {
       "TXT:default._bimi.example.com": [txt("default._bimi.example.com", "v=BIMI1; l=https://example.com/logo.svg")],
       "CNAME:selector1._domainkey.example.com": [
         { name: "selector1._domainkey.example.com", type: "CNAME", data: "selector1.example.onmicrosoft.com", ttl: 300 },
+      ],
+      "TXT:selector1._domainkey.example.com": [
+        txt("selector1.example.onmicrosoft.com", "v=DKIM1; k=rsa; p=MIIBIjANBgkqh"),
       ],
     };
 
@@ -152,6 +161,134 @@ describe("deterministic scan engine", () => {
     expect(result.checks.dns.status).toBe("warning");
     expect(result.checks.dns.records).toEqual(expect.arrayContaining([expect.objectContaining({ type: "A" })]));
     expect(finding?.remediation?.steps.length).toBeGreaterThan(1);
+  });
+
+  it("does not treat missing direct NS and SOA at an ordinary hostname as delegation failure", async () => {
+    const domain = "smtp.gmail.com";
+    const result = await scanDomain(domain, new FakeResolver({
+      [`A:${domain}`]: [{ name: domain, type: "A", data: "192.0.2.25", ttl: 300 }],
+    }));
+    const nsFinding = result.findings.find((finding) => finding.id === "dns-nameservers-not-found");
+    const soaFinding = result.findings.find((finding) => finding.id === "dns-soa-not-found");
+
+    expect(nsFinding?.severity).toBe("info");
+    expect(soaFinding?.severity).toBe("info");
+    expect(result.checks.dns.status).toBe("pass");
+    expect(result.findings.some((finding) =>
+      ["dns-nameservers-not-found", "dns-soa-not-found"].includes(finding.id) &&
+      finding.severity !== "info"
+    )).toBe(false);
+  });
+
+  it("recognizes a normalized null MX as intentionally disabled inbound mail", async () => {
+    const domain = "example.com";
+    const result = await scanDomain(domain, new FakeResolver({
+      [`MX:${domain}`]: [{ name: domain, type: "MX", data: "0 ." }],
+    }));
+    const mxDetail = result.checks.transport.details.find((detail) => detail.label === "MX");
+
+    expect(mxDetail?.value).toBe("Null MX (inbound mail disabled)");
+  });
+
+  it("rejects a null MX mixed with real exchangers", async () => {
+    const domain = "example.com";
+    const result = await scanDomain(domain, new FakeResolver({
+      [`MX:${domain}`]: [
+        { name: domain, type: "MX", data: "0 ." },
+        { name: domain, type: "MX", data: "10 mail.example.com" },
+      ],
+    }));
+
+    expect(result.checks.transport.status).toBe("fail");
+    expect(result.checks.transport.details.find((detail) => detail.label === "MX")?.value)
+      .toBe("Invalid null-MX combination");
+    expect(result.findings.map((finding) => finding.id)).toContain("invalid-null-mx");
+    expect(result.findings.map((finding) => finding.id)).toEqual(
+      expect.arrayContaining(["mta-sts-not-found", "tls-rpt-not-found"]),
+    );
+  });
+
+  it("keeps an invalid null MX critical when an optional transport lookup fails", async () => {
+    const domain = "example.com";
+    const result = await scanDomain(domain, new FakeResolver(
+      {
+        [`MX:${domain}`]: [
+          { name: domain, type: "MX", data: "0 ." },
+          { name: domain, type: "MX", data: "10 mail.example.com" },
+        ],
+      },
+      new Set([`TXT:_smtp._tls.${domain}`]),
+    ));
+
+    expect(result.checks.transport.status).toBe("fail");
+    expect(result.checks.transport.summary).toMatch(/invalid null-MX combination/iu);
+    expect(result.checks.transport.summary).toMatch(/TLS-RPT unavailable/iu);
+    expect(result.findings.map((finding) => finding.id)).toContain("invalid-null-mx");
+  });
+
+  it("does not count dangling aliases or revoked keys as active DKIM", async () => {
+    const domain = "example.com";
+    const result = await scanDomain(domain, new FakeResolver({
+      [`CNAME:selector1._domainkey.${domain}`]: [
+        { name: `selector1._domainkey.${domain}`, type: "CNAME", data: "missing.vendor.example" },
+      ],
+      [`TXT:selector2._domainkey.${domain}`]: [
+        txt(`selector2._domainkey.${domain}`, "v=DKIM1; p="),
+      ],
+    }));
+
+    expect(result.checks.dkim.status).toBe("unknown");
+    expect(result.dkimSelectors.find((selector) => selector.selector === "selector1")?.issue)
+      .toBe("unresolved-alias");
+    expect(result.dkimSelectors.find((selector) => selector.selector === "selector2")?.issue)
+      .toBe("revoked");
+    expect(result.findings.map((finding) => finding.id)).toEqual(
+      expect.arrayContaining(["dkim-alias-unresolved", "dkim-key-revoked"]),
+    );
+  });
+
+  it("reserves DNS headroom after detecting an over-limit SPF path", async () => {
+    let nativeCalls = 0;
+    const counted = <T>(value: T): T => {
+      nativeCalls += 1;
+      return value;
+    };
+    const resolver: NativeDnsResolver = {
+      resolve4: async () => counted([]),
+      resolve6: async () => counted([]),
+      resolveCaa: async () => counted([]),
+      resolveCname: async () => counted([]),
+      resolveMx: async () => counted([]),
+      resolveNs: async () => counted([]),
+      resolvePtr: async () => counted([]),
+      resolveSoa: async () => counted({
+        nsname: "ns1.example.com",
+        hostmaster: "hostmaster.example.com",
+        serial: 1,
+        refresh: 3600,
+        retry: 600,
+        expire: 1_209_600,
+        minttl: 300,
+      }),
+      resolveSrv: async () => counted([]),
+      resolveTxt: async (name) => {
+        nativeCalls += 1;
+        if (name === "example.com") {
+          const includes = Array.from({ length: 16 }, (_, index) => `include:i${index}.example.net`).join(" ");
+          return [[`v=spf1 ${includes} -all`]];
+        }
+        const include = /^i(\d+)\.example\.net$/u.exec(name);
+        if (!include) return [];
+        return [["v=spf1 -all"]];
+      },
+    };
+
+    const result = await scanDomain("example.com", new DnsClient({ resolver }));
+    const estimate = result.checks.spf.details.find((detail) => detail.label === "Lookup estimate");
+
+    expect(nativeCalls).toBe(42);
+    expect(estimate?.value).toBe("At least 16 (over the RFC limit of 10)");
+    expect(result.findings.map((finding) => finding.id)).toContain("spf-lookup-limit");
   });
 });
 

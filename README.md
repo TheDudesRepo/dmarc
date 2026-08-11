@@ -70,6 +70,7 @@ Vite runs on `http://localhost:5173` and proxies `/api` to the local Worker on p
 ```bash
 npm run check
 npm test
+npm run test:runtime
 npm run build
 ```
 
@@ -124,7 +125,7 @@ Request:
 }
 ```
 
-The advanced lookup supports A, AAAA, CAA, CNAME, MX, NS, PTR, SOA, SRV, and TXT through Cloudflare's native DNS resolver. PTR accepts an IPv4 or IPv6 address and converts it to the corresponding reverse-DNS owner name. An empty answer is evidence that the requested record type was not returned; it is not automatically a configuration failure.
+The advanced lookup supports A, AAAA, CAA, CNAME, MX, NS, PTR, SOA, SRV, and TXT through Cloudflare's native DNS resolver. PTR accepts an IPv4 or IPv6 address and converts it to the corresponding reverse-DNS owner name. For non-CNAME lookups, the Worker follows a bounded CNAME chain before resolving the terminal type so alias data cannot be mislabeled as another record. The response reports the canonical target even when its terminal answer is empty. An empty answer is evidence that the requested record type was not returned; it is not automatically a configuration failure.
 
 DNSSEC and specialist resource-record inspection is not exposed by this native lookup surface. Broader DNSSEC support and infrastructure-dependent checks such as SMTP handshakes, blocklists, worldwide propagation comparisons, port reachability, and other network probes remain future work rather than implied capabilities of this endpoint.
 

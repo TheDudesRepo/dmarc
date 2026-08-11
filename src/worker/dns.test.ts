@@ -101,7 +101,7 @@ describe("Cloudflare native DNS resolver", () => {
       resolve4: async () => [{ address: "192.0.2.10", ttl: 60 }],
       resolve6: async () => [{ address: "2001:db8::10", ttl: 120 }],
       resolveCaa: async () => [{ critical: 0, issue: "letsencrypt.org" }],
-      resolveCname: async () => ["target.example.net."],
+      resolveCname: async (name) => name === "alias.example.com" ? ["target.example.net."] : [],
       resolveMx: async () => [{ priority: 10, exchange: "mail.example.net." }],
       resolveNs: async () => ["ns1.example.net."],
       resolvePtr: async () => ["host.example.net."],
@@ -128,8 +128,8 @@ describe("Cloudflare native DNS resolver", () => {
     await expect(client.query("example.com", "CAA")).resolves.toEqual([
       { name: "example.com", type: "CAA", data: '0 issue "letsencrypt.org"' },
     ]);
-    await expect(client.query("example.com", "CNAME")).resolves.toEqual([
-      { name: "example.com", type: "CNAME", data: "target.example.net" },
+    await expect(client.query("alias.example.com", "CNAME")).resolves.toEqual([
+      { name: "alias.example.com", type: "CNAME", data: "target.example.net" },
     ]);
     await expect(client.query("example.com", "MX")).resolves.toEqual([
       { name: "example.com", type: "MX", data: "10 mail.example.net" },
@@ -178,12 +178,124 @@ describe("Cloudflare native DNS resolver", () => {
     ]);
   });
 
+  it("repairs an adjacent Workerd quote boundary in structured email TXT data", () => {
+    const flagged = MYAVISTA_DKIM.replace("R4n", 'R4n""');
+
+    expect(joinDnsTxtChunks([flagged])).toBe(MYAVISTA_DKIM);
+  });
+
   it("repairs DKIM records that put flags between the key type and public key", () => {
     const workerdValue = 'k=rsa; t=s; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A" "MIIBCgKCAQEA';
 
     expect(joinDnsTxtChunks([workerdValue])).toBe(
       "k=rsa; t=s; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA",
     );
+  });
+
+  it("repairs DKIM chunk boundaries regardless of tag order when the owner is a DKIM selector", async () => {
+    const client = new DnsClient({
+      resolver: nativeResolver({
+        resolveTxt: async () => [['h=sha256; k=rsa; n=rotation; p=MIIB""IjAN']],
+      }),
+    });
+
+    await expect(client.query("selector._domainkey.example.com", "TXT")).resolves.toEqual([
+      {
+        name: "selector._domainkey.example.com",
+        type: "TXT",
+        data: "h=sha256; k=rsa; n=rotation; p=MIIBIjAN",
+      },
+    ]);
+  });
+
+  it("preserves legitimate quotes outside the DKIM public-key tag", () => {
+    const value = 'v=DKIM1; n=Alice "" Bob; p=MIIB" "IjAN';
+
+    expect(joinDnsTxtChunks([value], "selector._domainkey.example.com")).toBe(
+      'v=DKIM1; n=Alice "" Bob; p=MIIBIjAN',
+    );
+  });
+
+  it("normalizes Workerd's empty exchange for an RFC 7505 null MX", async () => {
+    const client = new DnsClient({
+      resolver: nativeResolver({ resolveMx: async () => [{ priority: 0, exchange: "" }] }),
+    });
+
+    await expect(client.query("example.com", "MX")).resolves.toEqual([
+      { name: "example.com", type: "MX", data: "0 ." },
+    ]);
+  });
+
+  it("follows a CNAME chain before resolving a terminal record type", async () => {
+    const resolve4 = vi.fn<NativeDnsResolver["resolve4"]>(async (name) => {
+      if (name !== "target.example.net") throw new Error(`unexpected A query for ${name}`);
+      return [{ address: "192.0.2.25", ttl: 300 }];
+    });
+    const client = new DnsClient({
+      resolver: nativeResolver({
+        resolve4,
+        resolveCname: async (name) => {
+          if (name === "alias.example.com") return ["middle.example.net."];
+          if (name === "middle.example.net") return ["target.example.net."];
+          return [];
+        },
+      }),
+    });
+
+    await expect(client.queryFollowingCname("alias.example.com", "A")).resolves.toEqual({
+      canonicalName: "target.example.net",
+      aliases: [
+        { name: "alias.example.com", type: "CNAME", data: "middle.example.net" },
+        { name: "middle.example.net", type: "CNAME", data: "target.example.net" },
+      ],
+      answers: [
+      { name: "target.example.net", type: "A", ttl: 300, data: "192.0.2.25" },
+      ],
+    });
+    expect(resolve4).toHaveBeenCalledWith("target.example.net", { ttl: true });
+  });
+
+  it("rejects CNAME loops before querying the terminal record type", async () => {
+    const resolve4 = vi.fn<NativeDnsResolver["resolve4"]>(async () => []);
+    const client = new DnsClient({
+      resolver: nativeResolver({
+        resolve4,
+        resolveCname: async (name) => [name === "a.example" ? "b.example" : "a.example"],
+      }),
+    });
+
+    await expect(client.queryFollowingCname("a.example", "A")).rejects.toThrow(/CNAME loop/u);
+    expect(resolve4).not.toHaveBeenCalled();
+  });
+
+  it("uses one deadline across a CNAME chain and its terminal query", async () => {
+    const clock = manualClock();
+    const resolve4 = vi.fn<NativeDnsResolver["resolve4"]>(async () => []);
+    const resolveCname = vi.fn<NativeDnsResolver["resolveCname"]>(async (name) => {
+      if (name === "a.example") {
+        return new Promise<string[]>((resolve) => {
+          clock.timing.setTimeout(() => resolve(["b.example"]), 60);
+        });
+      }
+      return new Promise<string[]>(() => undefined);
+    });
+    const client = new DnsClient({
+      resolver: nativeResolver({ resolve4, resolveCname }),
+      timing: clock.timing,
+      timeoutMs: 100,
+    });
+    const result = client.queryFollowingCname("a.example", "A").catch((error: unknown) => error);
+
+    await flushMicrotasks(12);
+    clock.advance(60);
+    await flushMicrotasks(24);
+    expect(resolveCname).toHaveBeenCalledTimes(2);
+    clock.advance(40);
+    const error = await result;
+
+    expect(error).toBeInstanceOf(DnsQueryError);
+    expect((error as Error).message).toMatch(/timed out/u);
+    expect(resolve4).not.toHaveBeenCalled();
   });
 
   it("preserves separate TXT RRs and does not alter literal quotes in unrelated TXT data", async () => {
@@ -245,9 +357,9 @@ describe("Cloudflare native DNS resolver", () => {
       timing: clock.timing,
       timeoutMs: 100,
     });
-    const result = client.query("example.com", "TXT").catch((error: unknown) => error);
+    const result = client.queryDirect("example.com", "TXT").catch((error: unknown) => error);
 
-    await flushMicrotasks();
+    await flushMicrotasks(12);
     expect(resolveTxt).toHaveBeenCalledTimes(1);
     clock.advance(100);
     const error = await result;
@@ -268,25 +380,25 @@ describe("Cloudflare native DNS resolver", () => {
   });
 
   it("counts retries as native subrequests and never exceeds 48", async () => {
-    const resolveTxt = vi.fn<NativeDnsResolver["resolveTxt"]>(async (name) => {
+    const resolveCname = vi.fn<NativeDnsResolver["resolveCname"]>(async (name) => {
       if (name === "retry.example") throw dnsError("ESERVFAIL");
       return [];
     });
-    const client = new DnsClient({ resolver: nativeResolver({ resolveTxt }) });
+    const client = new DnsClient({ resolver: nativeResolver({ resolveCname }) });
 
-    await Promise.all(Array.from({ length: 47 }, (_, index) => client.query(`host${index}.example`, "TXT")));
-    await expect(client.query("retry.example", "TXT")).rejects.toThrow(/safety limit/u);
-    await expect(client.query("blocked.example", "TXT")).rejects.toThrow(/safety limit/u);
-    expect(resolveTxt).toHaveBeenCalledTimes(48);
+    await Promise.all(Array.from({ length: 47 }, (_, index) => client.query(`host${index}.example`, "CNAME")));
+    await expect(client.query("retry.example", "CNAME")).rejects.toThrow(/safety limit/u);
+    await expect(client.query("blocked.example", "CNAME")).rejects.toThrow(/safety limit/u);
+    expect(resolveCname).toHaveBeenCalledTimes(48);
   });
 
   it("queues native lookups above the six-connection Worker limit", async () => {
     let active = 0;
     let maximumActive = 0;
     const releases: Array<() => void> = [];
-    const resolveTxt = vi.fn<NativeDnsResolver["resolveTxt"]>(
+    const resolveCname = vi.fn<NativeDnsResolver["resolveCname"]>(
       async () =>
-        new Promise<string[][]>((resolve) => {
+        new Promise<string[]>((resolve) => {
           active += 1;
           maximumActive = Math.max(maximumActive, active);
           releases.push(() => {
@@ -295,18 +407,44 @@ describe("Cloudflare native DNS resolver", () => {
           });
         }),
     );
-    const client = new DnsClient({ resolver: nativeResolver({ resolveTxt }) });
-    const lookups = Array.from({ length: 10 }, (_, index) => client.query(`host${index}.example`, "TXT"));
+    const client = new DnsClient({ resolver: nativeResolver({ resolveCname }) });
+    const lookups = Array.from({ length: 10 }, (_, index) => client.query(`host${index}.example`, "CNAME"));
 
     await flushMicrotasks();
-    expect(resolveTxt).toHaveBeenCalledTimes(6);
+    expect(resolveCname).toHaveBeenCalledTimes(6);
     expect(maximumActive).toBe(6);
     for (const release of releases.splice(0, 6)) release();
     await flushMicrotasks(12);
-    expect(resolveTxt).toHaveBeenCalledTimes(10);
+    expect(resolveCname).toHaveBeenCalledTimes(10);
     expect(maximumActive).toBe(6);
     for (const release of releases.splice(0)) release();
     await expect(Promise.all(lookups)).resolves.toHaveLength(10);
+  });
+
+  it("removes timed-out queued work without reusing slots held by stalled native calls", async () => {
+    const clock = manualClock();
+    const releases: Array<() => void> = [];
+    const resolveCname = vi.fn<NativeDnsResolver["resolveCname"]>(
+      async () => new Promise<string[]>((resolve) => releases.push(() => resolve([]))),
+    );
+    const client = new DnsClient({
+      resolver: nativeResolver({ resolveCname }),
+      timing: clock.timing,
+      timeoutMs: 100,
+    });
+    const lookups = Array.from({ length: 7 }, (_, index) =>
+      client.query(`stalled${index}.example`, "CNAME").catch((error: unknown) => error),
+    );
+
+    await flushMicrotasks(12);
+    expect(resolveCname).toHaveBeenCalledTimes(6);
+    clock.advance(100);
+    const results = await Promise.all(lookups);
+    expect(results.every((result) => result instanceof DnsQueryError)).toBe(true);
+
+    for (const release of releases.splice(0)) release();
+    await flushMicrotasks(20);
+    expect(resolveCname).toHaveBeenCalledTimes(6);
   });
 
   it("rejects malformed or oversized native responses", async () => {

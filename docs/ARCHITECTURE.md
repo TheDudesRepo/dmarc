@@ -37,7 +37,7 @@ All resolution uses the Worker's fixed native DNS resolver. The scanner cannot s
 
 1. Validate HTTP method, content type, and body size.
 2. Normalize and validate the requested public domain.
-3. Execute native DNS queries with bounded concurrency, retry handling, timeouts, result-size limits, per-request caching, and a shared subrequest budget.
+3. Execute native DNS queries with bounded concurrency, retry handling, whole-query timeouts, result-size limits, per-request caching, bounded CNAME following, and a shared subrequest budget.
 4. Parse TXT record boundaries without combining separate resource records.
 5. Analyze DMARC, SPF, core DNS health, mail routing, transport controls, and limited DKIM selector evidence.
 6. Produce stable check identifiers and deterministic findings.

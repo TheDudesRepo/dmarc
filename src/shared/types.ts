@@ -40,6 +40,7 @@ export interface DkimSelectorResult {
   found: boolean;
   kind?: "TXT" | "CNAME";
   value?: string;
+  issue?: "revoked" | "unresolved-alias";
 }
 
 export interface ScanResult {
@@ -91,6 +92,7 @@ export type DnsLookupType =
 export interface DnsLookupResult {
   input: string;
   queryName: string;
+  canonicalName?: string;
   type: DnsLookupType;
   scannedAt: string;
   durationMs: number;

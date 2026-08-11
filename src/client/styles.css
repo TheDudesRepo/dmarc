@@ -7,7 +7,7 @@
   text-rendering: optimizeLegibility;
   --ink: #10221d;
   --ink-soft: #53645f;
-  --ink-faint: #788782;
+  --ink-faint: #5f716b;
   --forest-950: #061c17;
   --forest-900: #09271f;
   --forest-800: #123c31;
@@ -2010,7 +2010,7 @@ h4,
 
 .dns-result-heading p {
   margin: 0 0 2px;
-  color: var(--green-600);
+  color: var(--forest-700);
   font-size: 0.61rem;
   font-weight: 800;
   letter-spacing: 0.07em;
@@ -2201,6 +2201,50 @@ h4,
 .dns-answer-row > button svg {
   width: 13px;
   height: 13px;
+}
+
+.dns-copy-message {
+  display: block;
+  padding: 9px 13px;
+  border-top: 1px solid #e4ebe7;
+  color: var(--ink-soft);
+  background: #f7faf8;
+  font-size: 0.66rem;
+  line-height: 1.4;
+}
+
+.dns-result-guidance {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 13px 14px;
+  border: 1px solid #d7e6df;
+  border-radius: 10px;
+  color: var(--ink-soft);
+  background: var(--mint-50);
+}
+
+.dns-result-guidance > svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--green-600);
+}
+
+.dns-result-guidance strong,
+.dns-result-guidance span {
+  display: block;
+}
+
+.dns-result-guidance strong {
+  margin-bottom: 3px;
+  color: var(--forest-700);
+  font-size: 0.72rem;
+}
+
+.dns-result-guidance span {
+  font-size: 0.69rem;
+  line-height: 1.5;
 }
 
 .dns-lookup-scope {

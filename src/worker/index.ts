@@ -33,7 +33,7 @@ export default {
       return jsonResponse({
         status: "ok",
         service: "dmarc-ready-scanner",
-        version: "0.2.2",
+        version: "0.2.3",
         deploymentId: env.VERSION_METADATA?.id ?? null,
       });
     }

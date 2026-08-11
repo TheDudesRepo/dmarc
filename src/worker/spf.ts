@@ -33,7 +33,9 @@ export type SpfTxtResolver = (domain: string) => Promise<string[]>;
 
 const LOOKUP_MECHANISMS = new Set(["include", "a", "mx", "ptr", "exists"]);
 const MAX_RECURSION_DEPTH = 12;
-const MAX_EXPANDED_RECORDS = 16;
+// Keep operational headroom for alias following and transient retries after
+// the scanner's fixed DNS checks. Deeper paths are reported as lower bounds.
+const MAX_EXPANDED_RECORDS = 5;
 
 export function findSpfRecords(txtRecords: string[]): string[] {
   return txtRecords.filter((record) => /^\s*v=spf1(?:\s|$)/iu.test(record));

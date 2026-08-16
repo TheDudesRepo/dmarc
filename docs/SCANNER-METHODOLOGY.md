@@ -2,9 +2,9 @@
 
 ## Scope
 
-DMARC Ready evaluates a live snapshot of public DNS. It answers what the configured recursive resolver returned for a fixed set of owner names and record types at scan time. It does not prove that every legitimate sending system is aligned, enumerate every DNS owner, or authorize a change to production policy.
+DMARC Ready evaluates live snapshots of public DNS and, only through the separately authorized web-security workflow, a bounded set of root-web and TLS observations. DNS results answer what the configured recursive resolver returned for fixed owner names and record types at scan time. They do not prove that every legitimate sending system is aligned, enumerate every DNS owner, or authorize a change to production policy. Web results do not prove that an application is secure, vulnerable, or compliant.
 
-The scanner is DNS-only. It sends bounded DNS queries but does not connect to discovered web, mail, or other services. This is passive-style reconnaissance rather than a guarantee of zero interaction: authoritative DNS infrastructure can still observe recursive queries.
+The email, lookup, discovery, and IP tools are DNS-only and do not connect to discovered web, mail, or other services. This is passive-style reconnaissance rather than a guarantee of zero interaction: authoritative DNS infrastructure can still observe recursive queries. `POST /api/web-security` is the one bounded active exception and requires explicit authorized-use consent plus a server-enforced rolling quota before target work.
 
 ## DMARC
 
@@ -124,6 +124,62 @@ Enrichment is limited to an input that is both a single address (`/32` or `/128`
 
 The response attributes Team Cymru data to [Team Cymru IP to ASN Mapping](https://www.team-cymru.com/ip-asn-mapping). DNS absence is `not-found`; malformed or failed evidence is `indeterminate`; mixed evidence is `partial`; and multi-address CIDRs or non-global inputs are `not-applicable` with zero DNS queries. An explicit `/32` or `/128` is still one address and can be enriched. Deterministic calculation remains available even when enrichment is unavailable. This endpoint does not ping, connect to, scan, or issue HTTP requests to the supplied address.
 
+## Web application posture workflow
+
+The web scan accepts only one normalized hostname plus the exact `authorizedUse: true` and `disclaimerVersion: "2026-08-16"` values. The notice requires the caller to certify ownership or explicit permission, warns that target operators can log the traffic, prohibits harassment/disruption/evasion/unauthorized testing, and explains that results can be incomplete or wrong. The checkbox is not technical ownership proof.
+
+Before scan execution, the Worker consumes one of exactly five attempts available to the canonical `CF-Connecting-IP` during the preceding rolling hour. One SQLite Durable Object per client-IP digest serializes timestamp updates. A sixth attempt returns `429` until the oldest event is one hour old; a scan that fails after execution begins is not refunded. The default object name is a domain-separated SHA-256 digest, or HMAC-SHA-256 when an optional 32-or-more-character deployment secret is configured. Raw IPs and scan results are not stored in the object.
+
+Target work is intentionally small:
+
+1. Resolve A and AAAA; reject the entire target unless every returned address is a valid globally routable single address. Empty, private, loopback, link-local, reserved, transition/NAT64, malformed, or more than 16 addresses fail closed.
+2. Make one non-following `HEAD` request to `http://<hostname>/` to observe cleartext behavior.
+3. Attempt a manual `GET` redirect chain from `https://<hostname>/` with at most two redirects and inspect at most 131,072 bytes of the root response.
+4. If a usable HTTPS root response exists, make a fixed `OPTIONS` observation and one `GET` to an unpredictable scanner-generated not-found path. The caller cannot choose this path.
+5. Resolve immediately before each fetch and after its response; require the complete public address set to remain unchanged. Every redirect must stay on the exact hostname or its direct `www` counterpart, use a standard HTTP/HTTPS port, contain no credentials, avoid HTTPS downgrade, and pass the same address checks.
+6. Stop at six total HTTP requests, enforce a 2.5-second timer on each fetch/body read and a 30-second whole-scan deadline, cap every inspected root/error body at 131,072 bytes, and bound URLs, headers, HTML tags, cookies, and displayed evidence.
+
+Cloudflare `fetch` cannot pin an arbitrary external request to one prevalidated IP while preserving the intended Host header and TLS SNI. Pre/post address-set checks therefore detect observed DNS rebinding but cannot retroactively prevent a request if the DNS answer changed only during Cloudflare's internal lookup. The deployment has no VPC binding, uses the platform's ordinary public egress, and rejects any observed address instability. This residual platform limitation is not described as complete SSRF prevention.
+
+### Exactly 20 passive/basic checks
+
+The analyzer always returns these 20 check IDs in this order. Each check reports `pass`, `warning`, `fail`, `not-applicable`, or `unknown`, bounded evidence, remediation, and relevant OWASP Top 10 (2025) and Web Security Testing Guide references.
+
+| # | Check ID | Observation |
+| ---: | --- | --- |
+| 1 | `https-enforcement` | Cleartext behavior, HTTPS reachability, redirect safety, and TLS validity context |
+| 2 | `hsts` | Strict-Transport-Security presence and basic directive posture |
+| 3 | `content-security-policy` | Enforced CSP presence and basic high-risk directive posture |
+| 4 | `frame-protection` | CSP `frame-ancestors` and X-Frame-Options evidence |
+| 5 | `mime-sniffing` | X-Content-Type-Options `nosniff` |
+| 6 | `referrer-policy` | Referrer-Policy presence and basic posture |
+| 7 | `permissions-policy` | Permissions-Policy presence |
+| 8 | `cross-origin-isolation` | COOP, COEP, and CORP response-header evidence |
+| 9 | `cors-policy` | Response to a fixed synthetic Origin and high-risk ACAO/credentials combinations |
+| 10 | `http-methods` | Allow/public-method evidence from the fixed OPTIONS observation; no state-changing method is sent |
+| 11 | `cookie-secure` | Secure on observed security-sensitive Set-Cookie values |
+| 12 | `cookie-httponly` | HttpOnly on observed security-sensitive cookies |
+| 13 | `cookie-samesite` | Explicit SameSite and the Secure requirement for SameSite=None |
+| 14 | `cookie-scope-prefix` | Cookie Domain/Path scope and `__Host-`/`__Secure-` prefix consistency |
+| 15 | `cache-control` | Public caching directives on the observed root response |
+| 16 | `technology-disclosure` | Unnecessary response and HTML generator banners |
+| 17 | `error-handling` | Status/body disclosure on one unpredictable generated not-found path |
+| 18 | `mixed-content` | Cleartext active/resource URLs in the bounded root HTML |
+| 19 | `form-transport` | Password/form action protocol and method evidence without submission |
+| 20 | `subresource-integrity` | Integrity metadata on eligible third-party scripts/styles in bounded HTML |
+
+The web score weights transport, CSP, CORS, and session controls more heavily than informational hardening. `unknown` evidence is never scored as a failure, and `not-applicable` weight is removed from the denominator. A letter grade is assigned only when at least 70% of applicable weight was evaluated and HTTPS enforcement, HSTS, and CSP all produced bounded evidence; a confirmed HTTPS-enforcement failure always caps the grade at `F`.
+
+These are OWASP-aligned observations, not “the OWASP Top 20,” an official OWASP scanner, or complete coverage of the OWASP Top 10/WSTG. They do not test authentication or authorization decisions, injection, business logic, dependencies, APIs behind undiscovered paths, server internals, client-side runtime behavior, or exploitability. Header presence is not proof that a policy is correct for the application; root-page absence is not proof that a control is absent everywhere.
+
+### Bounded TLS snapshot
+
+TLS work connects directly to at most two representative, already validated IP addresses on port 443 with the requested hostname as SNI. IPv4 and IPv6 are represented when available. Each reachable endpoint can use six handshakes: one default profile, one each constrained to TLS 1.0, 1.1, 1.2, and 1.3, and one fixed TLS 1.2 RSA/AES-CBC compatibility profile. Every connection has an independent 3.5-second wall-clock deadline—not an activity-reset timeout—and endpoints are processed sequentially so the five profile probes after the base handshake stay within the runtime socket cap.
+
+The result can include certificate subject/issuer/SANs, validity, serial/fingerprint, key size and signature algorithm when exposed; a bounded chain; runtime trust and hostname validation; negotiated protocol/cipher; ALPN; ephemeral-key information; version support; and the fixed legacy-profile result. A deterministic grade summarizes confirmed evidence. Unknown or platform-blocked profile evidence remains partial/unavailable and must not be converted into a confirmed weakness.
+
+This is intentionally not SSL Labs-equivalent. It does not enumerate every cipher/client combination, assess every resolved endpoint, simulate multiple clients, or send Heartbleed, ROBOT, DROWN, padding-oracle, or other vulnerability payloads. Cloudflare blocks raw TCP/TLS sockets to Cloudflare IP ranges and Worker self-loops, so HTTPS can succeed while raw TLS evidence is unavailable. The result includes an optional external SSL Labs report link; DMARC Ready does not invoke or proxy the Qualys API.
+
 ## Found, empty, partial, and unavailable
 
 The scanner keeps resolver absence separate from operational failure:
@@ -152,9 +208,9 @@ The score summarizes published configuration. It is not a security rating and is
 
 Aggregate-report history, sender ownership, business confirmation, and change monitoring are required before recommending quarantine or reject for an active production domain.
 
-## Safe passive boundary
+## Safe bounded boundary
 
-This release does not perform port or vulnerability scans, ping, traceroute, AXFR, banner grabbing, SMTP handshakes, arbitrary HTTP fetches, blocklist queries, or service fingerprinting. Those operations create direct target traffic and substantially different authorization and abuse risks. They are not hidden behind the DNS routes and are not implied by discovered host or address output.
+Except for the documented web-security workflow, this release does not connect to targets. It does not perform general port or vulnerability scans, ping, traceroute, AXFR, banner grabbing, SMTP handshakes, arbitrary HTTP fetches, crawling, login/form submission, blocklist queries, exploit probes, or caller-configurable service fingerprinting. Those operations create substantially different authorization and abuse risks. They are not hidden behind the DNS routes and are not implied by discovered host or address output.
 
 See [Toolbox scope](TOOLBOX-SCOPE.md) for the controls required before any active capability could be offered.
 
@@ -171,3 +227,9 @@ See [Toolbox scope](TOOLBOX-SCOPE.md) for the controls required before any activ
 - The scanner uses one public recursive resolver and is not a multi-vantage DNS-propagation test.
 - The native interface does not expose authoritative-server consistency, raw DNS response codes, or DNSSEC validation state, so the scanner does not claim those checks.
 - The IP/CIDR utility's Team Cymru data is third-party DNS evidence, not routing authority or ownership proof.
+- Web authorization is caller-attested rather than cryptographically verified, and shared hosting/CDNs can put third-party infrastructure behind an authorized name.
+- Five attempts per IP per rolling hour can affect unrelated users behind NAT and can be distributed across changing IPv6 addresses or multiple clients; it is an abuse-reduction control, not identity.
+- HTTP analysis observes only the root flow and one generated not-found path, and static HTML inspection does not execute JavaScript or discover application routes.
+- DNS rebinding is checked before and after fetches, but Cloudflare's external fetch cannot be pinned to the prevalidated address; the residual timing limitation described above remains.
+- TLS samples at most two endpoints and fixed profiles. Cloudflare-hosted targets can have platform-blocked raw TLS evidence even when HTTPS is available.
+- OWASP mappings identify related risk/testing areas; they do not make the 20 checks complete OWASP coverage or a certification.

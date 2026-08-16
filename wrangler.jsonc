@@ -13,6 +13,20 @@
   "observability": {
     "enabled": true
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "WEB_SCAN_RATE_LIMITER",
+        "class_name": "WebScanRateLimiter"
+      }
+    ]
+  },
+  "exports": {
+    "WebScanRateLimiter": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
   "version_metadata": {
     "binding": "VERSION_METADATA"
   }

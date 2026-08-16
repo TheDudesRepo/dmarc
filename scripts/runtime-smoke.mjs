@@ -26,7 +26,7 @@ const bundle = await build({
   format: "esm",
   platform: "browser",
   target: "es2022",
-  external: ["node:dns"],
+  external: ["node:dns", "node:tls"],
   logLevel: "silent",
   write: false,
 });
@@ -82,7 +82,17 @@ try {
   const health = await requestJson("/api/health");
   assert.equal(health.response.status, 200);
   assert.equal(health.body.status, "ok");
-  assert.equal(health.body.version, "0.3.0");
+  assert.equal(health.body.version, "0.4.0");
+
+  const webScanQueryStart = outboundQueries.length;
+  const webScanWithoutRateLimitSetup = await postJson("/api/web-security", {
+    hostname: "example.com",
+    authorizedUse: true,
+    disclaimerVersion: "2026-08-16",
+  });
+  assert.equal(webScanWithoutRateLimitSetup.response.status, 503);
+  assert.equal(webScanWithoutRateLimitSetup.body.code, "SERVICE_UNAVAILABLE");
+  assert.equal(outboundQueries.length - webScanQueryStart, 0, "failed rate-limit setup must not contact the target");
 
   for (const lookup of directLookupCases) {
     const result = await postJson("/api/lookup", lookup);
@@ -211,7 +221,7 @@ try {
   );
 
   console.log(
-    `Runtime smoke passed: ${directLookupCases.length} native DNS types, 7 alias paths, null MX, MyAvista SPF/DKIM/DMARC, DNS snapshot (${snapshotQueryCount} queries), core/extended discovery (${discoveryQueryCounts.join("/")} queries), IP enrichment (${ipQueryCount} queries), subnet arithmetic, and API boundaries.`,
+    `Runtime smoke passed: ${directLookupCases.length} native DNS types, 7 alias paths, null MX, MyAvista SPF/DKIM/DMARC, DNS snapshot (${snapshotQueryCount} queries), core/extended discovery (${discoveryQueryCounts.join("/")} queries), IP enrichment (${ipQueryCount} queries), subnet arithmetic, fail-closed web-scan boundary, and API boundaries.`,
   );
 } finally {
   await miniflare.dispose();

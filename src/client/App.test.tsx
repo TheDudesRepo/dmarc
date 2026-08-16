@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -10,7 +10,7 @@ import type {
   ScanResult,
   SpfLookupAnalysis,
 } from "../shared/types";
-import { AdvancedDnsExplorer, DNS_LOOKUP_MODES, DNS_LOOKUP_TYPES, isDnsLookupResult, isScanResult } from "./App";
+import App, { AdvancedDnsExplorer, DNS_LOOKUP_MODES, DNS_LOOKUP_TYPES, isDnsLookupResult, isScanResult } from "./App";
 
 function lookupResult(type: DnsLookupType = "A", overrides: Partial<DnsLookupResult> = {}): DnsLookupResult {
   return {
@@ -81,6 +81,18 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+describe("application navigation", () => {
+  it("links the web-security scanner from desktop and compact navigation", () => {
+    const { container } = render(<App />);
+    const desktop = screen.getByRole("navigation", { name: "Primary navigation" });
+    const mobile = screen.getByRole("navigation", { name: "Mobile navigation" });
+
+    expect(within(desktop).getByRole("link", { name: "Web security" }).getAttribute("href")).toBe("#web-security");
+    expect(within(mobile).getByRole("link", { name: "Web security" }).getAttribute("href")).toBe("#web-security");
+    expect(container.querySelector("#web-security")).not.toBeNull();
+  });
 });
 
 describe("DNS lookup response validation", () => {

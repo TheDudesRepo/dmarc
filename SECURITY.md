@@ -16,24 +16,26 @@ Do not include customer data, credentials, or destructive proof-of-concept paylo
 
 ## Current security model
 
-The current release is a public, unauthenticated, read-only DNS scanner. It does not request DNS-provider credentials, mailbox access, or email content, and it does not persist scan history in an application database. DNS answers are attacker-controlled data and must never be inserted as HTML.
+The current release is a public, unauthenticated, read-only DNS and web-posture scanner. It does not request DNS-provider credentials, mailbox access, or email content, and it does not persist scan results or scan history in an application database. The web-security abuse-control Durable Objects retain at most five rolling event timestamps per client-IP-derived object. DNS, HTTP, TLS, and certificate evidence is attacker-controlled data and must never be inserted as HTML.
 
-All resolution uses Cloudflare Workers' native `node:dns` implementation, backed by the platform's fixed Cloudflare DNS resolver at 1.1.1.1. The API cannot select an upstream resolver or convert a caller-supplied value or DNS answer into a URL fetch or arbitrary network connection.
+All resolution uses Cloudflare Workers' native `node:dns` implementation, backed by the platform's fixed Cloudflare DNS resolver at 1.1.1.1. Callers cannot select an upstream resolver. DNS-only routes never convert caller input or answers into a URL fetch or network connection. The separate web-security route constructs fixed root and unpredictable not-found URLs from one validated hostname and makes only its documented HTTP and TLS observations.
 
 ## Input and request controls
 
 The Worker enforces:
 
-- JSON content type, object shape, required fields, and a 2,048-byte body limit
+- JSON content type, fatal UTF-8 decoding, object shape, required fields, and a streaming 2,048-byte body limit that cancels on overflow
 - Public-domain normalization and DNS label/name length limits
 - Rejection of credentials, ports, paths, local names, and IP literals on domain routes
 - An allowlist of direct-lookup modes; PTR accepts one IP literal and converts it to a reverse-DNS owner
 - Strict single-address/CIDR parsing on the IP endpoint, rejecting URLs, lists, explicit ranges, scoped IPv6, malformed masks, and ambiguous address syntax
 - Exactly `core` or `extended` for host discovery, with no caller-supplied labels or wordlists
+- Exactly one normalized hostname—not a URL, IP literal, port, path, credentials, query, fragment, or payload—for web-security scans
+- Exact `authorizedUse: true` and `disclaimerVersion: "2026-08-16"` consent before the web quota or any target work; this is an attestation, not ownership proof
 - HTTP method restrictions and sanitized JSON errors
 - `no-store` and browser-hardening headers on API responses
 
-Extra input is never used to select a protocol, server, port, URL, command, discovery dictionary, or unsupported DNS type. A CIDR supplied to the IP calculator is arithmetic input, never an active target range.
+Extra input is never used to select a server, port, path, payload, command, discovery dictionary, or unsupported DNS type. The web route has only fixed HTTP/HTTPS methods and ports; a CIDR supplied to the IP calculator is arithmetic input, never an active target range.
 
 ## DNS resource controls
 
@@ -54,6 +56,21 @@ The random wildcard label prevents a catch-all DNS response from being presented
 
 The IP endpoint performs no DNS work for multi-address CIDRs or special-use addresses. For one globally routable address, including an explicit `/32` or `/128`, it permits at most four logical enrichment queries: PTR, Team Cymru origin ASN/prefix TXT, and AS descriptions for at most two origin ASNs. Owners and response fields are fixed or derived from the parsed address/validated ASN, and answer counts, characters, dates, prefixes, and ASN ranges are checked. Enrichment errors become partial or indeterminate evidence and never invalidate the local calculation.
 
+## Web and TLS resource controls
+
+`POST /api/web-security` is the only route that intentionally contacts a supplied hostname's web service. Its execution is fixed and bounded:
+
+- One non-following `HEAD` observation begins at cleartext HTTP, one `GET` begins at HTTPS, and `OPTIONS` plus one `GET` to an unpredictable scanner-generated not-found path are attempted only on a usable final HTTPS origin. No path is accepted from the caller.
+- At most six HTTP requests are made. HTTPS follows at most two manual redirect hops; the cleartext observation follows none.
+- Redirects may use only HTTP/HTTPS, standard ports, no credentials, and the exact hostname or its direct `www` counterpart. HTTPS downgrade, loops, malformed/overlong locations, and every other host are rejected.
+- Each fetch/body read has a 2.5-second timer and the whole scan has a 30-second deadline. Only the first 131,072 bytes of each inspected root/error body are read, and header, tag, evidence, and URL sizes are bounded.
+- Every A and AAAA answer must parse as one globally routable address. Private, loopback, link-local, reserved, transition/NAT64, malformed, empty, or over-16-address results fail closed. Redirect destinations receive the same validation.
+- The HTTP implementation resolves immediately before each request and again after the response, requiring the complete public address set to remain unchanged. This detects and rejects observed DNS rebinding. Cloudflare `fetch` cannot be pinned to an arbitrary prevalidated IP while retaining the target Host/SNI; therefore validation cannot retroactively prevent a request if DNS changed only during the platform's own lookup. The Worker has no VPC binding, uses only standard public egress, restricts redirects, and treats a changed set as unsafe, but this residual platform limitation remains part of the threat model.
+- Raw `node:tls` connections are addressed to already validated public IPs on port 443 with the requested hostname as SNI. At most two representative endpoints are sampled; each uses one default handshake, four fixed TLS-version handshakes, and one fixed TLS 1.2 RSA/AES-CBC compatibility profile, each with an independent 3.5-second wall-clock deadline and abort-driven socket destruction.
+- Cloudflare blocks raw sockets to Cloudflare address ranges and Worker self-loops. Those results are `platform-blocked`/unavailable and are never converted into a target failure.
+
+The 20 web checks observe root-response headers, cookie attributes, bounded HTML, redirects, fixed methods, and the fixed-shape not-found response. They do not log in, crawl, submit forms, intentionally send state-changing methods or bodies, enumerate or guess meaningful paths, bypass controls, or send exploit payloads. Their OWASP Top 10 (2025) and WSTG references are mappings for remediation context, not a claim of official OWASP certification or complete OWASP testing.
+
 ## DNS answer and error handling
 
 TXT character strings are combined only within one DNS resource record. Separate TXT records remain separate so attacker-controlled data cannot fabricate one combined SPF or DMARC policy. Non-CNAME lookup modes follow aliases with bounded loop detection and preserve the terminal owner instead of interpreting CNAME text as another record type.
@@ -62,23 +79,24 @@ Resolver-reported absence produces an empty result. Timeout, SERVFAIL, REFUSED, 
 
 The UI clears old surface-scan data when the domain changes or a new scan begins, aborts superseded work, and ignores late responses associated with an older request. This prevents stale evidence from being visually attributed to the new domain.
 
-## Safe DNS-only scope
+## Safe bounded scope
 
-The Worker makes bounded DNS queries only. It does not perform:
+Most Worker routes make bounded DNS queries only. The explicitly authorized web-security route adds the narrow root-page, scanner-generated not-found, HTTP/HTTPS, and TLS behavior above. The product still does not perform:
 
-- Port or vulnerability scanning
+- Port scanning, broad vulnerability scanning, or exploit probes
 - ICMP ping or traceroute
 - DNS zone transfer (AXFR)
 - Banner grabbing or service fingerprinting
-- SMTP, TLS, or other service handshakes
-- Arbitrary HTTP requests, screenshots, crawling, or header inspection
+- SMTP or caller-selected service handshakes
+- Caller-defined TLS profiles
+- Arbitrary HTTP requests, screenshots, crawling, authentication, form submission, or state-changing probes
 - User-provided resolver, wordlist, active netblock scan, port, or URL operations
 
 An `ANY` query would not make the service exhaustive: it addresses one known owner, can be deliberately minimized, and cannot enumerate a zone. The implementation uses explicit record-type queries instead. It does not ingest certificate-transparency, historical/passive-DNS, search, or other enrichment datasets, so its output is not DNSDumpster-equivalent.
 
-Anonymous HackerTarget-like active tools are excluded because they would allow third parties to relay scans through the service, create unsolicited load against unrelated targets, and open SSRF, redirect, shared-hosting, and cloud-metadata risks. A syntactically valid public domain is not proof that the caller owns it, and control of a domain does not necessarily prove authority over every shared IP it resolves to.
+Broader HackerTarget-like active tools remain excluded because they would allow third parties to relay scans through the service, create unsolicited load against unrelated targets, and magnify SSRF, redirect, shared-hosting, and cloud-metadata risks. A syntactically valid public domain and an authorization checkbox do not prove that the caller owns it, and control of a domain does not necessarily prove authority over every shared IP it resolves to. The narrow web scanner mitigates but cannot eliminate that authorization limitation.
 
-## Requirements for any future active tools
+## Requirements for broader future active tools
 
 Active capabilities must not be added directly to the anonymous DNS routes. A future design would require a separate execution plane with, at minimum:
 
@@ -91,11 +109,15 @@ Active capabilities must not be added directly to the anonymous DNS routes. A fu
 - Fixed operation allowlists, port/protocol boundaries, timeouts, redirect limits, response-size limits, output normalization, and retention limits
 - Audit logs, abuse detection, suspension, contact channels, and operator review
 
-The public IP/CIDR tool remains inside the DNS-only boundary. Its UI calls the same strict API route, which performs deterministic arithmetic locally and sends only reverse/Team Cymru DNS queries for the exact eligible address; it never contacts that address.
+The public IP/CIDR tool remains inside the DNS-only boundary. Its UI calls the same strict API route, which performs deterministic arithmetic locally and sends only reverse/Team Cymru DNS queries for the exact eligible address; it never contacts that address. The web-security route is not a general execution plane and cannot be configured with arbitrary targets or operations.
 
-## Deployment rate limiting
+## Web-scan rate limiting and privacy
 
-The application enforces per-request DNS budgets, but it does not provide caller identity or aggregate request throttling. Before exposing these routes to material public traffic, operators should configure Cloudflare edge or WAF rate limits for `/api/*`, with tighter per-route quotas for the three-pass DNS surface scan and IP enrichment. This deployment control is also required before expanding the bounded passive scope.
+Before any target DNS, HTTP, HTTPS, or TLS scan work, the web-security route consumes one slot from a SQLite Durable Object selected by the canonical `CF-Connecting-IP`. It deliberately ignores `X-Forwarded-For` and other caller-controlled alternatives. A transaction serializes the exact rolling window: five accepted attempts in the preceding 3,600 seconds, then `429 RATE_LIMITED` until the oldest timestamp expires. Failed target/upstream scans consume a slot because target work has already begun. Missing/invalid trusted client IP, missing binding, malformed Durable Object response, and unavailable Durable Object storage fail closed with `503`.
+
+The raw client IP is not stored in Durable Object state or used as the object name. With no optional secret, a domain-separated SHA-256 digest selects the object; because IP addresses have low entropy, this is pseudonymization rather than anonymity. Operators should set an unpredictable, 32-or-more-character `WEB_SCAN_RATE_LIMIT_SECRET` so object names use HMAC-SHA-256 and resist offline guessing. Only bounded rolling timestamps are stored in the object. Cloudflare edge/request logs remain subject to the operator's separate logging and retention settings.
+
+The limit is per client IP, not per person or target. NAT can cause unrelated users to share a quota; IPv6 privacy-address changes and distributed clients can receive separate quotas. It is an abuse-reduction control, not identity, ownership verification, or a complete denial-of-service defense. Operators should still apply Cloudflare WAF/bot controls and broader `/api/*` limits appropriate to their traffic and cost exposure.
 
 ## Future report ingestion
 

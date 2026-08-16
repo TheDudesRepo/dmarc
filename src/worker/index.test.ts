@@ -1,6 +1,8 @@
 import dns from "node:dns";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import worker from "./index";
+import { WEB_SECURITY_DISCLAIMER } from "../shared/types";
+import worker, { createWorker } from "./index";
+import { WebSecurityTargetError, type WebSecurityScanExecution } from "./web-security";
 
 const env = {
   ASSETS: {
@@ -22,10 +24,261 @@ describe("Worker API boundary", () => {
     const body = (await response.json()) as { status: string; version: string; deploymentId: string | null };
 
     expect(response.status).toBe(200);
-    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.3.0", deploymentId: null }));
+    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.4.0", deploymentId: null }));
     expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.headers.get("cache-control")).toContain("no-store");
+  });
+
+  it("returns the rolling web-scan quota with an epoch RateLimit-Reset header", async () => {
+    const resetAt = "2026-08-16T15:30:00.250Z";
+    const scanResult = {
+      hostname: "example.com",
+      effectiveUrl: "https://example.com/",
+      scannedAt: "2026-08-16T14:30:00.000Z",
+      durationMs: 10,
+      score: 100,
+      grade: "A",
+      headline: "Strong observable web hardening",
+      summary: "Bounded test result.",
+      tls: {
+        status: "unavailable",
+        grade: "N/A",
+        summary: "Unavailable in unit test.",
+        resolvedAddresses: ["203.0.113.10"],
+        endpoints: [],
+        endpointsTruncated: false,
+        reportUrl: "https://www.ssllabs.com/ssltest/analyze.html?d=example.com&hideResults=on",
+        limitations: [],
+      },
+      checks: [],
+      coverage: { evaluated: 0, total: 20, unknown: 20, notApplicable: 0 },
+      requestBudget: { httpRequests: 0, tlsConnections: 0, maxResponseBytes: 131_072, redirectHopsFollowed: 0 },
+      disclaimer: WEB_SECURITY_DISCLAIMER,
+    } satisfies WebSecurityScanExecution;
+    const scan = vi.fn(async () => scanResult);
+    const webWorker = createWorker({
+      scanWebSecurity: scan,
+      consumeWebScanQuota: async () => ({
+        allowed: true,
+        quota: { limit: 5, remaining: 4, resetAt, windowSeconds: 3600 },
+        retryAfterSeconds: 0,
+        timestamps: [Date.parse("2026-08-16T14:30:00.250Z")],
+      }),
+    });
+    const response = await webWorker.fetch(
+      new Request("https://scanner.example/api/web-security", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "cf-connecting-ip": "203.0.113.7",
+        },
+        body: JSON.stringify({
+          hostname: "Example.COM.",
+          authorizedUse: true,
+          disclaimerVersion: "2026-08-16",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("ratelimit-limit")).toBe("5");
+    expect(response.headers.get("ratelimit-remaining")).toBe("4");
+    expect(response.headers.get("ratelimit-reset")).toBe(String(Math.ceil(Date.parse(resetAt) / 1_000)));
+    expect(scan).toHaveBeenCalledWith("example.com");
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({
+      hostname: "example.com",
+      quota: { limit: 5, remaining: 4, resetAt, windowSeconds: 3600 },
+    }));
+  });
+
+  it("returns quota and delta Retry-After headers without scanning when the web quota is exhausted", async () => {
+    const scan = vi.fn();
+    const resetAt = "2026-08-16T15:30:00.250Z";
+    const webWorker = createWorker({
+      scanWebSecurity: scan,
+      consumeWebScanQuota: async () => ({
+        allowed: false,
+        quota: { limit: 5, remaining: 0, resetAt, windowSeconds: 3600 },
+        retryAfterSeconds: 725,
+        timestamps: [1, 2, 3, 4, 5],
+      }),
+    });
+    const response = await webWorker.fetch(
+      new Request("https://scanner.example/api/web-security", {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.7" },
+        body: JSON.stringify({
+          hostname: "example.com",
+          authorizedUse: true,
+          disclaimerVersion: "2026-08-16",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("ratelimit-limit")).toBe("5");
+    expect(response.headers.get("ratelimit-remaining")).toBe("0");
+    expect(response.headers.get("ratelimit-reset")).toBe(String(Math.ceil(Date.parse(resetAt) / 1_000)));
+    expect(response.headers.get("retry-after")).toBe("725");
+    expect(scan).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual({
+      error: "This client has used its five web security scans in the rolling one-hour window.",
+      code: "RATE_LIMITED",
+      quota: { limit: 5, remaining: 0, resetAt, windowSeconds: 3600 },
+    });
+  });
+
+  it("requires current authorized-use consent before consuming web quota", async () => {
+    const consume = vi.fn();
+    const scan = vi.fn();
+    const webWorker = createWorker({ scanWebSecurity: scan, consumeWebScanQuota: consume });
+    const response = await webWorker.fetch(
+      new Request("https://scanner.example/api/web-security", {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.7" },
+        body: JSON.stringify({
+          hostname: "example.com",
+          authorizedUse: true,
+          disclaimerVersion: "stale-version",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(403);
+    expect(consume).not.toHaveBeenCalled();
+    expect(scan).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({ code: "AUTHORIZATION_REQUIRED" }));
+  });
+
+  it("cancels a chunked oversized web-security body before consuming quota", async () => {
+    const consume = vi.fn();
+    const scan = vi.fn();
+    const webWorker = createWorker({ scanWebSecurity: scan, consumeWebScanQuota: consume });
+    const encoded = new TextEncoder().encode(JSON.stringify({
+      hostname: "example.com",
+      authorizedUse: true,
+      disclaimerVersion: "2026-08-16",
+      padding: "x".repeat(3_000),
+    }));
+    const chunks = [encoded.slice(0, 1_024), encoded.slice(1_024, 2_049), encoded.slice(2_049)];
+    let pulls = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[pulls];
+        pulls += 1;
+        if (chunk === undefined) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }, { highWaterMark: 0 });
+
+    const response = await webWorker.fetch(
+      new Request("https://scanner.example/api/web-security", {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.7" },
+        body,
+        duplex: "half",
+      } as RequestInit & { duplex: "half" }),
+      env,
+    );
+
+    expect(response.status).toBe(413);
+    expect(pulls).toBe(2);
+    expect(cancelled).toBe(true);
+    expect(consume).not.toHaveBeenCalled();
+    expect(scan).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({ code: "BAD_REQUEST" }));
+  });
+
+  it("rejects an invalid hostname before consuming a quota slot", async () => {
+    const consume = vi.fn();
+    const scan = vi.fn();
+    const webWorker = createWorker({ scanWebSecurity: scan, consumeWebScanQuota: consume });
+    const response = await webWorker.fetch(
+      new Request("https://scanner.example/api/web-security", {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.7" },
+        body: JSON.stringify({
+          hostname: "https://127.0.0.1/admin",
+          authorizedUse: true,
+          disclaimerVersion: "2026-08-16",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(400);
+    expect(consume).not.toHaveBeenCalled();
+    expect(scan).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({ code: "INVALID_DOMAIN" }));
+  });
+
+  it("returns quota metadata when a target rejection consumes an accepted slot", async () => {
+    const resetAt = "2026-08-16T15:30:00.000Z";
+    const scan = vi.fn(async () => {
+      throw new WebSecurityTargetError("The target resolves to a non-public address.");
+    });
+    const webWorker = createWorker({
+      scanWebSecurity: scan,
+      consumeWebScanQuota: async () => ({
+        allowed: true,
+        quota: { limit: 5, remaining: 2, resetAt, windowSeconds: 3600 },
+        retryAfterSeconds: 0,
+        timestamps: [1, 2, 3],
+      }),
+    });
+    const response = await webWorker.fetch(
+      new Request("https://scanner.example/api/web-security", {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.7" },
+        body: JSON.stringify({
+          hostname: "example.com",
+          authorizedUse: true,
+          disclaimerVersion: "2026-08-16",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("ratelimit-remaining")).toBe("2");
+    expect(scan).toHaveBeenCalledWith("example.com");
+    await expect(response.json()).resolves.toEqual({
+      error: "The target resolves to a non-public address.",
+      code: "UNSAFE_TARGET",
+      quota: { limit: 5, remaining: 2, resetAt, windowSeconds: 3600 },
+    });
+  });
+
+  it("fails closed when CF-Connecting-IP is absent even if X-Forwarded-For is supplied", async () => {
+    const scan = vi.fn();
+    const webWorker = createWorker({ scanWebSecurity: scan });
+    const response = await webWorker.fetch(
+      new Request("https://scanner.example/api/web-security", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": "203.0.113.7" },
+        body: JSON.stringify({
+          hostname: "example.com",
+          authorizedUse: true,
+          disclaimerVersion: "2026-08-16",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(503);
+    expect(scan).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({ code: "SERVICE_UNAVAILABLE" }));
   });
 
   it("exposes the immutable deployment identifier when the binding is configured", async () => {

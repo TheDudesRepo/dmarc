@@ -1,6 +1,6 @@
 # DMARC Ready
 
-DMARC Ready is a public, read-only email-authentication and DNS toolbox designed to make the path from monitoring to enforcement understandable. Enter a domain to inspect its published DMARC and SPF records, commonly discoverable DKIM selectors, mail routing, adjacent transport-security controls, explicit apex DNS RRsets, and a bounded set of common public hostnames. A built-in IP utility performs deterministic IPv4/IPv6 and CIDR calculations with limited DNS enrichment.
+DMARC Ready is a public, read-only email-authentication, DNS, and web-posture toolbox. Enter a domain to inspect published DMARC and SPF records, commonly discoverable DKIM selectors, mail routing, adjacent transport-security controls, explicit apex DNS RRsets, and a bounded set of common public hostnames. A built-in IP utility performs deterministic IPv4/IPv6 and CIDR calculations with limited DNS enrichment. An explicitly authorized web scan collects a bounded TLS snapshot and exactly 20 passive/basic HTTP hardening observations from the hostname's root page and one scanner-generated not-found path.
 
 The current release is an intentionally focused MVP: no accounts, no mailbox access, no DNS writes, and no AI-generated enforcement decisions.
 
@@ -18,6 +18,8 @@ The current release is an intentionally focused MVP: no accounts, no mailbox acc
 - Checks a small set of common DKIM selectors without claiming that non-discovery means DKIM is absent
 - Provides direct lookup for ten common resource-record types plus the analyzed SPF mode
 - Calculates IPv4/IPv6 networks, ranges, classifications, netmasks, and related values locally; a single global address can receive bounded PTR and Team Cymru DNS evidence
+- Reports representative TLS certificate chains, hostname/trust status, negotiated protocol/cipher, ALPN, ephemeral-key details, fixed TLS-version profiles, and one legacy CBC profile when the Cloudflare runtime can reach the endpoint
+- Runs exactly 20 non-exploitative web checks covering HTTPS, response headers, CORS/method observations, cookie attributes, caching/disclosure, error handling, forms, mixed content, and subresource integrity, cross-referenced to relevant OWASP Top 10 (2025) and WSTG areas
 - Produces deterministic, prioritized findings with raw DNS evidence and guided remediation
 - Shows reviewable DNS record templates when a safe template is possible, with deployment cautions
 - Distinguishes records that were found, names with an empty answer, and queries that were temporarily unavailable
@@ -30,6 +32,7 @@ The current release is an intentionally focused MVP: no accounts, no mailbox acc
 3. **No automatic DNS changes.** The scanner is read-only and does not ask for DNS credentials.
 4. **Uncertainty is explicit.** Timeouts, undiscoverable DKIM selectors, and partial lookups are not converted into false failures.
 5. **Deterministic core.** Protocol parsing, scoring, and safety gates are code—not LLM judgment.
+6. **Authorized and bounded active work.** The web scan requires an explicit authorization attestation, validates public destinations, and enforces a server-side rolling quota before target traffic begins.
 
 ## Stack
 
@@ -37,14 +40,20 @@ The current release is an intentionally focused MVP: no accounts, no mailbox acc
 - Vite
 - Cloudflare Workers Static Assets
 - Cloudflare Workers' native `node:dns` resolver, backed by Cloudflare DNS at 1.1.1.1
+- Cloudflare Workers' `node:tls` support for bounded, IP-addressed TLS handshakes with SNI
+- SQLite-backed Durable Objects for the exact rolling web-scan quota
 - Vitest
 - Wrangler
 
-The frontend and API Worker deploy as one Cloudflare Worker. Static files are served from the Vite `dist` directory and `/api/*` routes run through the Worker. DNS requests use the platform's fixed native resolver with bounded concurrency, per-request caching, timeouts, strict result limits, resolver-error handling, and a hard subrequest budget.
+The frontend and API Worker deploy as one Cloudflare Worker. Static files are served from the Vite `dist` directory and `/api/*` routes run through the Worker. DNS requests use the platform's fixed native resolver with bounded concurrency, per-request caching, timeouts, strict result limits, resolver-error handling, and a hard subrequest budget. The web-security route additionally uses bounded HTTP/HTTPS requests and raw TLS handshakes; its per-client quota is serialized in one SQLite Durable Object per client-IP digest.
 
 ## Safe scope and completeness
 
-This release performs DNS-only, passive-style reconnaissance: it sends bounded queries through the fixed recursive resolver but does not connect to discovered hosts or services. The IP calculator uses local arithmetic and, for one globally routable address, DNS-only PTR and Team Cymru IP-to-ASN lookups. It does not perform port or vulnerability scanning, ping, traceroute, zone transfer (AXFR), banner grabbing, or arbitrary HTTP requests.
+Most tools remain DNS-only, passive-style reconnaissance. The one deliberate exception is `POST /api/web-security`: after explicit consent and server-side rate limiting, it makes a small, fixed set of HTTP/HTTPS requests and TLS handshakes to the hostname entered. It accepts no caller-selected URL, path, port, payload, credential, wordlist, or arbitrary method; the only non-root path is an unpredictable scanner-generated not-found probe used to observe public error handling. It validates every resolved address as global before use, revalidates allowed redirect destinations and address stability, uses manual redirects, timeouts, response-size limits, and request/connection budgets, and never sends exploit payloads. The IP calculator remains local/DNS-only and never contacts the supplied address.
+
+The web result is not an SSL Labs-equivalent assessment, penetration test, vulnerability scan, compliance certification, or proof of security. It samples at most two representative TLS endpoints and fixed protocol/cipher profiles. Cloudflare blocks raw TCP/TLS sockets to Cloudflare address ranges and Worker self-loops, so affected TLS evidence is reported as unavailable rather than failed; an optional link lets the user start a separate SSL Labs assessment under that service's terms. DMARC Ready does not call or proxy the Qualys SSL Labs API.
+
+All other active capabilities remain excluded: no general port scan, vulnerability exploitation, ping, traceroute, AXFR, banner grabbing, SMTP handshake, crawling, screenshots, or caller-defined network requests.
 
 The DNS surface view is deliberately finite. An `ANY` response is not a zone listing and can be minimized by authoritative servers; it cannot enumerate owner names. DMARC Ready therefore queries named RR types and a documented common-host list instead of implying that `ANY` means “all records.” The result is not exhaustive and is not equivalent to DNSDumpster or another product that combines certificate-transparency, historical/passive-DNS, search, or other third-party datasets. See [Toolbox scope](docs/TOOLBOX-SCOPE.md) for the capability boundary and future requirements for active tools.
 
@@ -98,7 +107,13 @@ The repository is configured for [Cloudflare Workers Builds](https://developers.
 6. Keep the deploy command as `npx wrangler deploy`.
 7. Save and deploy.
 
-Cloudflare will deploy the frontend and Worker API together. No environment variables or secrets are required for the basic scanner.
+Cloudflare will deploy the frontend and Worker API together. The declarative Worker config creates the SQLite Durable Object class and binding. The route works without an additional secret by using a domain-separated SHA-256 client-IP digest. For stronger pseudonymization of low-entropy IP addresses, add `WEB_SCAN_RATE_LIMIT_SECRET` as an encrypted Worker secret containing at least 32 unpredictable characters in the Cloudflare dashboard, or run:
+
+```bash
+npx wrangler secret put WEB_SCAN_RATE_LIMIT_SECRET
+```
+
+When the secret is configured, object names use HMAC-SHA-256 instead. The web-security route fails closed with `503 SERVICE_UNAVAILABLE` when the Durable Object binding or trusted Cloudflare client-IP header is unavailable, or when a configured secret is too short. The DNS and local-calculation routes do not use this setting.
 
 For a direct authenticated deployment:
 
@@ -191,6 +206,24 @@ DNS enrichment runs only when the input represents one globally routable address
 
 DNSSEC and specialist resource-record inspection are not exposed by this native lookup surface. Broader DNSSEC support and infrastructure-dependent checks such as SMTP handshakes, blocklists, worldwide propagation comparisons, port reachability, and other network probes remain future work rather than implied capabilities of these endpoints.
 
+### `POST /api/web-security`
+
+Request:
+
+```json
+{
+  "hostname": "example.com",
+  "authorizedUse": true,
+  "disclaimerVersion": "2026-08-16"
+}
+```
+
+The caller must certify ownership of or explicit permission to test the exact hostname and accept the current acceptable-use notice. This attestation is a legal/safety gate, not technical proof of ownership. The route accepts a normalized hostname only—never a caller-selected URL, path, port, IP literal, credential, or request payload—and observes only ports 80 and 443 at the root path, allowed same-host/`www` redirects, and one unpredictable scanner-generated not-found path for the error-handling observation.
+
+The Worker consumes one quota slot before DNS, HTTP, HTTPS, or TLS scan execution. It uses only Cloudflare's `CF-Connecting-IP` value, canonicalizes the address, derives either a domain-separated SHA-256 digest or a keyed HMAC-SHA-256 digest when the optional secret is set, and stores only rolling event timestamps in the corresponding SQLite Durable Object. Each client IP receives exactly five attempts in the preceding rolling hour; a sixth returns `429 RATE_LIMITED` with `quota`, `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` (Unix epoch seconds), and `Retry-After` (seconds). A scan that later produces a target or upstream error still consumes its slot.
+
+The response separates unavailable evidence from failures and includes actual request-budget usage. HTTP work is capped at six requests, two HTTPS redirect hops (the cleartext `HEAD` does not follow redirects), 2.5 seconds per fetch or body read, 30 seconds for the whole scan, and 131,072 bytes per inspected root/error response. All returned addresses are safety-checked, at most 16 are accepted, and TLS handshakes sample at most two representative endpoints with at most six fixed connections each. See [Scanner methodology](docs/SCANNER-METHODOLOGY.md) for the exact 20 checks and interpretation limits.
+
 ## Repository layout
 
 ```text
@@ -212,12 +245,14 @@ DMARC expresses a domain owner's requested handling policy. A receiver ultimatel
 
 ## Security and privacy
 
-- Scans query public DNS records only. Query names and record types are resolved by Cloudflare's native DNS service; no user-selectable resolver or target URL is accepted.
+- DNS tools query public DNS records only. Query names and record types are resolved by Cloudflare's native DNS service; no user-selectable resolver is accepted.
 - Snapshot and discovery work is capped by fixed RR types, fixed hostname profiles, a random wildcard control, per-request DNS budgets, bounded concurrency, and result-size limits.
 - IP-network input is strictly parsed as one address/CIDR, calculations are local, and optional evidence is limited to PTR and explicitly attributed Team Cymru DNS queries for one global address.
+- Web-security input is one hostname with explicit authorized-use consent. The scan is limited to root-page HTTP/HTTPS observations, one scanner-generated not-found path, allowed redirects, fixed TLS profiles, strict destination checks, timeouts, and byte/request/connection caps.
+- The web-security quota is exactly five attempts per canonical `CF-Connecting-IP` in the preceding rolling hour. Raw client IPs are not stored in Durable Object state; a domain-separated digest (or keyed digest when the optional secret is configured) selects an object, which retains only bounded event timestamps.
 - The MVP does not persist scan history in an application database.
 - DNS answers are untrusted input and are rendered as text.
-- DNS lookups use the Worker's fixed native resolver and never fetch a user-supplied URL.
+- No route fetches a caller-supplied URL; the web scanner constructs fixed root URLs and one unpredictable not-found URL from a validated hostname.
 - Security headers are applied by the Worker.
 - API requests have strict input and size limits.
 

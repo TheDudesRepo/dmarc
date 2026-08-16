@@ -21,6 +21,7 @@ import {
   LoaderCircle,
   LockKeyhole,
   MailCheck,
+  Menu,
   Network,
   Radar,
   RefreshCw,
@@ -49,6 +50,7 @@ import type {
 } from "../shared/types";
 import { DnsSurfaceScanner } from "./DnsSurfaceScanner";
 import { IpNetworkTool } from "./IpNetworkTool";
+import { WebSecurityScanner } from "./WebSecurityScanner";
 
 const EXAMPLE_DOMAINS = ["google.com", "github.com", "cloudflare.com"];
 
@@ -456,10 +458,22 @@ function Header() {
         <nav className="desktop-nav" aria-label="Primary navigation">
           <a href="#dns-explorer">DNS tools</a>
           <a href="#dns-surface">Surface scan</a>
+          <a href="#web-security">Web security</a>
           <a href="#ip-tools">IP tools</a>
           <a href="#methodology">Methodology</a>
           <a href="#roadmap">Roadmap</a>
         </nav>
+        <details className="mobile-nav">
+          <summary><Menu aria-hidden="true" /> Tools</summary>
+          <nav aria-label="Mobile navigation">
+            <a href="#dns-explorer" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>DNS tools</a>
+            <a href="#dns-surface" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Surface scan</a>
+            <a href="#web-security" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Web security</a>
+            <a href="#ip-tools" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>IP tools</a>
+            <a href="#methodology" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Methodology</a>
+            <a href="#roadmap" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Roadmap</a>
+          </nav>
+        </details>
         <button className="button button-small button-quiet" type="button" onClick={scrollToScanner}>
           Scan a domain <ArrowRight aria-hidden="true" />
         </button>
@@ -1626,6 +1640,7 @@ export default function App() {
         )}
         <AdvancedDnsExplorer suggestedDomain={result?.domain ?? ""} />
         <DnsSurfaceScanner suggestedDomain={result?.domain ?? ""} />
+        <WebSecurityScanner suggestedDomain={result?.domain ?? ""} />
         <IpNetworkTool />
         <HowItWorks />
         <Methodology />

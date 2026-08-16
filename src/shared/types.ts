@@ -74,7 +74,158 @@ export interface ScanResult {
 
 export interface ScanError {
   error: string;
-  code: "INVALID_DOMAIN" | "METHOD_NOT_ALLOWED" | "BAD_REQUEST" | "UPSTREAM_ERROR" | "NOT_FOUND";
+  code:
+    | "INVALID_DOMAIN"
+    | "METHOD_NOT_ALLOWED"
+    | "BAD_REQUEST"
+    | "UPSTREAM_ERROR"
+    | "NOT_FOUND"
+    | "AUTHORIZATION_REQUIRED"
+    | "RATE_LIMITED"
+    | "UNSAFE_TARGET"
+    | "SERVICE_UNAVAILABLE";
+}
+
+export type WebSecurityCheckStatus = "pass" | "warning" | "fail" | "not-applicable" | "unknown";
+
+export type WebSecurityCheckId =
+  | "https-enforcement"
+  | "hsts"
+  | "content-security-policy"
+  | "frame-protection"
+  | "mime-sniffing"
+  | "referrer-policy"
+  | "permissions-policy"
+  | "cross-origin-isolation"
+  | "cors-policy"
+  | "http-methods"
+  | "cookie-secure"
+  | "cookie-httponly"
+  | "cookie-samesite"
+  | "cookie-scope-prefix"
+  | "cache-control"
+  | "technology-disclosure"
+  | "error-handling"
+  | "mixed-content"
+  | "form-transport"
+  | "subresource-integrity";
+
+export interface WebSecurityCheck {
+  id: WebSecurityCheckId;
+  status: WebSecurityCheckStatus;
+  title: string;
+  summary: string;
+  evidence: string[];
+  remediation: string;
+  owasp: {
+    top10: string[];
+    wstg: string[];
+  };
+}
+
+export type TlsProtocolVersion = "TLSv1" | "TLSv1.1" | "TLSv1.2" | "TLSv1.3";
+
+export interface TlsCipherObservation {
+  name: string;
+  standardName?: string;
+  version?: string;
+  bits?: number;
+}
+
+export interface TlsProtocolObservation {
+  version: TlsProtocolVersion;
+  status: "supported" | "not-supported" | "unknown";
+  cipher?: TlsCipherObservation;
+  note?: string;
+}
+
+export interface TlsCertificateSummary {
+  subject: string;
+  issuer: string;
+  subjectAltNames: string[];
+  validFrom?: string;
+  validTo?: string;
+  daysRemaining?: number;
+  serialNumber?: string;
+  fingerprint256?: string;
+  bits?: number;
+  signatureAlgorithm?: string;
+  ca?: boolean;
+}
+
+export interface TlsEndpointObservation {
+  address: string;
+  status: "ready" | "platform-blocked" | "unreachable" | "unavailable";
+  summary: string;
+  authorized?: boolean;
+  authorizationError?: string;
+  hostnameValid?: boolean;
+  negotiatedProtocol?: string;
+  cipher?: TlsCipherObservation;
+  alpnProtocol?: string;
+  ephemeralKey?: string;
+  certificate?: TlsCertificateSummary;
+  certificateChain: TlsCertificateSummary[];
+  protocols: TlsProtocolObservation[];
+  weakCipher: {
+    status: "supported" | "not-supported" | "unknown";
+    cipher?: TlsCipherObservation;
+    note?: string;
+  };
+}
+
+export interface TlsAssessment {
+  status: "complete" | "partial" | "unavailable";
+  grade: "A" | "B" | "C" | "D" | "F" | "N/A";
+  summary: string;
+  resolvedAddresses: string[];
+  endpoints: TlsEndpointObservation[];
+  endpointsTruncated: boolean;
+  reportUrl: string;
+  limitations: string[];
+}
+
+export interface WebScanQuota {
+  limit: 5;
+  remaining: number;
+  resetAt: string;
+  windowSeconds: 3600;
+}
+
+export const WEB_SECURITY_DISCLAIMER_VERSION = "2026-08-16" as const;
+
+export const WEB_SECURITY_DISCLAIMER =
+  "Authorized use only. By starting this scan, you certify that you own the target or have explicit permission to test it. The service makes a small number of DNS, HTTP, HTTPS, and TLS requests to the hostname entered, and target operators may log them. Do not use it to harass, disrupt, evade controls, or test systems without authorization. Results are automated, point-in-time observations; they may be incomplete or wrong and do not prove that a system is secure, vulnerable, or compliant. You are responsible for applicable law and third-party terms. Abuse may result in blocking and reporting.";
+
+export interface WebSecurityScanResult {
+  hostname: string;
+  effectiveUrl: string;
+  scannedAt: string;
+  durationMs: number;
+  score: number;
+  grade: "A" | "B" | "C" | "D" | "F" | "N/A";
+  headline: string;
+  summary: string;
+  tls: TlsAssessment;
+  checks: WebSecurityCheck[];
+  coverage: {
+    evaluated: number;
+    total: 20;
+    unknown: number;
+    notApplicable: number;
+  };
+  quota: WebScanQuota;
+  requestBudget: {
+    httpRequests: number;
+    tlsConnections: number;
+    maxResponseBytes: number;
+    redirectHopsFollowed: number;
+  };
+  disclaimer: string;
+}
+
+export interface WebSecurityScanError extends ScanError {
+  quota?: WebScanQuota;
 }
 
 export type DnsLookupType =

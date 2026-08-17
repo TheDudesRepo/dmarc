@@ -172,7 +172,7 @@ export function DnsSurfaceScanner({ suggestedDomain }: DnsSurfaceScannerProps) {
       <div className="container">
         <div className="dns-surface-heading">
           <div>
-            <div className="eyebrow"><span /> All discovered DNS</div>
+            <div className="eyebrow"><span /> DNS &amp; OSINT · bounded discovery</div>
             <h2 id="dns-surface-title">Map the public DNS surface in one scan.</h2>
           </div>
           <p>

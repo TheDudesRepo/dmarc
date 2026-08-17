@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cresswell.rocks/schemas/tls-deep-v1.json",
+  "title": "Cresswell deep TLS endpoint evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "scanner",
+    "target",
+    "status",
+    "startedAt",
+    "durationMs",
+    "grade",
+    "budget",
+    "phases",
+    "sections",
+    "issues",
+    "limitations"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "tls-deep-v1" },
+    "scanner": { "$ref": "#/$defs/scanner" },
+    "target": { "$ref": "#/$defs/target" },
+    "status": { "$ref": "#/$defs/availability" },
+    "startedAt": { "type": "string", "format": "date-time", "maxLength": 32 },
+    "durationMs": { "type": "integer", "minimum": 0, "maximum": 180000 },
+    "grade": { "$ref": "#/$defs/grade" },
+    "budget": { "$ref": "#/$defs/budget" },
+    "phases": {
+      "type": "array",
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/phase" }
+    },
+    "sections": { "$ref": "#/$defs/sections" },
+    "issues": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/issue" }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": { "type": "string", "maxLength": 512 }
+    }
+  },
+  "$defs": {
+    "scanner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "version", "commit", "sourceUrl", "license", "profileRevision"],
+      "properties": {
+        "engine": { "const": "testssl.sh" },
+        "version": { "const": "3.2.4" },
+        "commit": { "const": "97763a411c525720a5f9bd9d2cded416b10f210a" },
+        "sourceUrl": { "const": "https://github.com/testssl/testssl.sh" },
+        "license": { "const": "GPL-2.0-only" },
+        "profileRevision": { "const": "safe-v1" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostname", "address", "addressFamily", "port", "sni", "profile"],
+      "properties": {
+        "hostname": { "type": "string", "minLength": 3, "maxLength": 253 },
+        "address": { "type": "string", "minLength": 3, "maxLength": 64 },
+        "addressFamily": { "enum": [4, 6] },
+        "port": { "const": 443 },
+        "sni": { "type": "string", "minLength": 3, "maxLength": 253 },
+        "profile": { "const": "safe" }
+      }
+    },
+    "availability": { "enum": ["complete", "partial", "unavailable"] },
+    "grade": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "score", "coverage", "methodology", "caps"],
+      "properties": {
+        "value": { "enum": ["A", "B", "C", "D", "F", "N/A"] },
+        "score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["evaluatedWeight", "totalWeight"],
+          "properties": {
+            "evaluatedWeight": { "type": "integer", "minimum": 0 },
+            "totalWeight": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "methodology": { "const": "cresswell-tls-v1" },
+        "caps": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "maxGrade", "reason"],
+            "properties": {
+              "id": { "type": "string", "maxLength": 96 },
+              "maxGrade": { "enum": ["B", "C", "D", "F"] },
+              "reason": { "type": "string", "maxLength": 384 }
+            }
+          }
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deadlineMs",
+        "maxProcesses",
+        "processesStarted",
+        "processesCompleted",
+        "maxConcurrentConnections",
+        "maxConnections",
+        "connectionsOpened",
+        "maxPhaseOutputBytes",
+        "outputBytes",
+        "maxResponseBytes"
+      ],
+      "properties": {
+        "deadlineMs": { "type": "integer", "minimum": 120000, "maximum": 180000 },
+        "maxProcesses": { "const": 3 },
+        "processesStarted": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "processesCompleted": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "maxConcurrentConnections": { "const": 5 },
+        "maxConnections": { "const": 128 },
+        "connectionsOpened": { "type": "integer", "minimum": 0, "maximum": 128 },
+        "maxPhaseOutputBytes": { "const": 393216 },
+        "outputBytes": { "type": "integer", "minimum": 0, "maximum": 1179648 },
+        "maxResponseBytes": { "const": 163840 }
+      }
+    },
+    "phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "exitCode", "durationMs", "outputBytes"],
+      "properties": {
+        "id": { "enum": ["identity", "cryptography", "compatibility"] },
+        "status": { "enum": ["complete", "timed-out", "failed", "output-limit", "unavailable"] },
+        "exitCode": { "type": ["integer", "null"] },
+        "durationMs": { "type": "integer", "minimum": 0, "maximum": 180000 },
+        "outputBytes": { "type": "integer", "minimum": 0, "maximum": 393216 }
+      }
+    },
+    "sections": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["certificate", "protocols", "ciphers", "keyExchange", "features", "clientSimulations", "knownIssues"],
+      "properties": {
+        "certificate": { "$ref": "#/$defs/section" },
+        "protocols": { "$ref": "#/$defs/section" },
+        "ciphers": { "$ref": "#/$defs/section" },
+        "keyExchange": { "$ref": "#/$defs/section" },
+        "features": { "$ref": "#/$defs/section" },
+        "clientSimulations": { "$ref": "#/$defs/section" },
+        "knownIssues": { "$ref": "#/$defs/section" }
+      }
+    },
+    "section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "grade", "observations"],
+      "properties": {
+        "status": { "$ref": "#/$defs/availability" },
+        "grade": { "$ref": "#/$defs/grade" },
+        "observations": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/observation" }
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "evidenceKind", "severity", "summary"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "sourceId": { "type": "string", "minLength": 1, "maxLength": 96 },
+        "status": { "enum": ["pass", "warning", "fail", "info", "unknown", "not-tested"] },
+        "evidenceKind": { "enum": ["tested", "inferred", "not-testable"] },
+        "severity": { "enum": ["critical", "high", "medium", "low", "info", "none"] },
+        "summary": { "type": "string", "maxLength": 384 },
+        "details": {
+          "type": "object",
+          "maxProperties": 16,
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string", "maxLength": 512 },
+              { "type": "integer" },
+              { "type": "boolean" },
+              { "type": "null" },
+              {
+                "type": "array",
+                "maxItems": 128,
+                "items": { "type": "string", "maxLength": 512 }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "section", "observationId", "severity", "evidenceKind", "summary"],
+      "properties": {
+        "id": { "type": "string", "maxLength": 180 },
+        "section": { "enum": ["certificate", "protocols", "ciphers", "keyExchange", "features", "clientSimulations", "knownIssues"] },
+        "observationId": { "type": "string", "maxLength": 160 },
+        "severity": { "enum": ["critical", "high", "medium", "low"] },
+        "evidenceKind": { "enum": ["tested", "inferred", "not-testable"] },
+        "summary": { "type": "string", "maxLength": 384 }
+      }
+    }
+  }
+}

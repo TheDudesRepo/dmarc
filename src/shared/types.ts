@@ -228,6 +228,196 @@ export interface WebSecurityScanError extends ScanError {
   quota?: WebScanQuota;
 }
 
+export const SECURITY_ASSESSMENT_DISCLAIMER_VERSION = "2026-08-16-deep-v1" as const;
+
+export const SECURITY_ASSESSMENT_DISCLAIMER =
+  "Authorized use only. By starting this combined assessment, you certify that you own the target or have explicit permission to test it. The service performs the twenty bounded web-control observations plus a deep TLS assessment that may make hundreds of TLS handshakes, protocol and cipher negotiations, client simulations, and non-destructive cryptographic-flaw probes against public TCP port 443 endpoints. Target operators and Cloudflare's paid container platform may log this activity. The scanner does not submit credentials, change application data, crawl the site, execute denial-of-service tests, or send exploit payloads intended to alter the target. Do not use it to harass, disrupt, evade controls, or test systems without authorization. Results are automated, point-in-time observations; they may be incomplete or wrong and do not prove that a system is secure, vulnerable, or compliant. You are responsible for applicable law and third-party terms. Abuse may result in blocking and reporting.";
+
+export type DeepTlsGradeValue = "A" | "B" | "C" | "D" | "F" | "N/A";
+export type DeepTlsReportStatus = "complete" | "partial" | "unavailable";
+export type DeepTlsSectionName =
+  | "certificate"
+  | "protocols"
+  | "ciphers"
+  | "keyExchange"
+  | "features"
+  | "clientSimulations"
+  | "knownIssues";
+
+export interface DeepTlsGradeCap {
+  id: string;
+  maxGrade: "B" | "C" | "D" | "F";
+  reason: string;
+}
+
+export interface DeepTlsGrade {
+  value: DeepTlsGradeValue;
+  score: number | null;
+  coverage: {
+    evaluatedWeight: number;
+    totalWeight: number;
+  };
+  methodology: "cresswell-tls-v1";
+  caps: DeepTlsGradeCap[];
+}
+
+export interface DeepTlsObservation {
+  id: string;
+  sourceId?: string;
+  status: "pass" | "warning" | "fail" | "info" | "unknown" | "not-tested";
+  evidenceKind: "tested" | "inferred" | "not-testable";
+  severity: "critical" | "high" | "medium" | "low" | "info" | "none";
+  summary: string;
+  details?: Record<string, string | number | boolean | string[] | null>;
+}
+
+export interface DeepTlsSection {
+  status: DeepTlsReportStatus;
+  grade: DeepTlsGrade;
+  observations: DeepTlsObservation[];
+}
+
+export interface DeepTlsIssue {
+  id: string;
+  section: DeepTlsSectionName;
+  observationId: string;
+  severity: "critical" | "high" | "medium" | "low";
+  evidenceKind: "tested" | "inferred" | "not-testable";
+  summary: string;
+}
+
+export interface DeepTlsResponseV1 {
+  schemaVersion: "tls-deep-v1";
+  scanner: {
+    engine: "testssl.sh";
+    version: "3.2.4";
+    commit: "97763a411c525720a5f9bd9d2cded416b10f210a";
+    sourceUrl: "https://github.com/testssl/testssl.sh";
+    license: "GPL-2.0-only";
+    profileRevision: "safe-v1";
+  };
+  target: {
+    hostname: string;
+    address: string;
+    addressFamily: 4 | 6;
+    port: 443;
+    sni: string;
+    profile: "safe";
+  };
+  status: DeepTlsReportStatus;
+  startedAt: string;
+  durationMs: number;
+  grade: DeepTlsGrade;
+  budget: {
+    deadlineMs: number;
+    maxProcesses: 3;
+    processesStarted: number;
+    processesCompleted: number;
+    maxConcurrentConnections: 5;
+    maxConnections: 128;
+    connectionsOpened: number;
+    maxPhaseOutputBytes: 393_216;
+    outputBytes: number;
+    maxResponseBytes: 163_840;
+  };
+  phases: Array<{
+    id: "identity" | "cryptography" | "compatibility";
+    status: "complete" | "timed-out" | "failed" | "output-limit" | "unavailable";
+    exitCode: number | null;
+    durationMs: number;
+    outputBytes: number;
+  }>;
+  sections: Record<DeepTlsSectionName, DeepTlsSection>;
+  issues: DeepTlsIssue[];
+  limitations: string[];
+}
+
+export interface DeepTlsAssessmentResult {
+  status: DeepTlsReportStatus;
+  grade: DeepTlsGrade;
+  summary: string;
+  resolvedAddresses: string[];
+  endpoints: DeepTlsResponseV1[];
+  endpointsTruncated: boolean;
+  limitations: string[];
+}
+
+export type SecurityAssessmentWebResult = Omit<WebSecurityScanResult, "quota" | "tls">;
+
+export interface SecurityAssessmentResult {
+  schemaVersion: "security-assessment-v1";
+  hostname: string;
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
+  web: SecurityAssessmentWebResult;
+  tls: DeepTlsAssessmentResult;
+  disclaimer: string;
+}
+
+export type SecurityAssessmentJobStatus = "queued" | "running" | "complete" | "cancelled" | "failed";
+export type SecurityAssessmentProgressPhase =
+  | "queued"
+  | "web-security"
+  | "tls-validation"
+  | "tls-scanning"
+  | "finalizing"
+  | "complete"
+  | "cancelled"
+  | "failed";
+
+export interface SecurityAssessmentProgress {
+  phase: SecurityAssessmentProgressPhase;
+  message: string;
+  completedEndpoints: number;
+  totalEndpoints: number;
+  percent?: number;
+  updatedAt: string;
+}
+
+export interface SecurityAssessmentJobError {
+  code:
+    | "TARGET_CHANGED"
+    | "TARGET_UNAVAILABLE"
+    | "WEB_SCAN_FAILED"
+    | "TLS_SCAN_FAILED"
+    | "ORCHESTRATION_FAILED";
+  message: string;
+}
+
+export interface SecurityAssessmentJobResource {
+  jobId: string;
+  hostname: string;
+  status: SecurityAssessmentJobStatus;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  progress: SecurityAssessmentProgress;
+  result?: SecurityAssessmentResult;
+  error?: SecurityAssessmentJobError;
+}
+
+export interface SecurityAssessmentCreateResponse extends SecurityAssessmentJobResource {
+  quota: WebScanQuota;
+  reuse: "new" | "cache-hit" | "single-flight";
+  pollAfterSeconds: number;
+  /** Present only for the caller that created new work; never returned by status. */
+  cancelToken?: string;
+}
+
+export interface SecurityAssessmentCancelResponse {
+  cancelled: boolean;
+  job: SecurityAssessmentJobResource;
+}
+
+export interface SecurityAssessmentApiError extends Omit<ScanError, "code"> {
+  code:
+    | ScanError["code"]
+    | "JOB_NOT_FOUND"
+    | "ORCHESTRATION_ERROR";
+  quota?: WebScanQuota;
+}
+
 export type DnsLookupType =
   | "A"
   | "AAAA"

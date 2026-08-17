@@ -1,0 +1,81 @@
+{
+  "version": "3.2.4 fixture",
+  "scanResult": [
+    {
+      "targetHost": "example.com",
+      "ip": "93.184.216.34",
+      "port": "443",
+      "protocols": [
+        { "id": "SSLv2", "severity": "OK", "finding": "not offered" },
+        { "id": "SSLv3", "severity": "OK", "finding": "not offered" },
+        { "id": "TLS1", "severity": "INFO", "finding": "not offered" },
+        { "id": "TLS1_1", "severity": "INFO", "finding": "not offered" },
+        { "id": "TLS1_2", "severity": "OK", "finding": "offered" },
+        { "id": "TLS1_3", "severity": "OK", "finding": "offered with final" },
+        { "id": "ALPN", "severity": "OK", "finding": "h2 http/1.1 offered" }
+      ],
+      "ciphers": [
+        { "id": "cipherlist_NULL", "severity": "OK", "finding": "not offered" },
+        { "id": "cipherlist_aNULL", "severity": "OK", "finding": "not offered" },
+        { "id": "cipherlist_EXPORT", "severity": "OK", "finding": "not offered" },
+        { "id": "cipherlist_LOW", "severity": "OK", "finding": "not offered" },
+        { "id": "cipherlist_3DES_IDEA", "severity": "OK", "finding": "not offered" },
+        { "id": "cipherlist_OBSOLETED", "severity": "OK", "finding": "not offered" },
+        { "id": "cipherlist_STRONG_NOFS", "severity": "OK", "finding": "offered" },
+        { "id": "cipherlist_STRONG_FS", "severity": "OK", "finding": "offered" }
+      ],
+      "serverPreferences": [
+        { "id": "cipher-tls1_2_xc02f", "severity": "OK", "finding": "TLSv1.2 xc02f ECDHE-RSA-AES128-GCM-SHA256 ECDH 253 AESGCM 128 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" },
+        { "id": "cipher-tls1_3_x1301", "severity": "OK", "finding": "TLSv1.3 x1301 TLS_AES_128_GCM_SHA256 ECDH 253 AESGCM 128 TLS_AES_128_GCM_SHA256" },
+        { "id": "supportedciphers_TLSv1_3", "severity": "INFO", "finding": "TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305_SHA256" }
+      ],
+      "fs": [
+        { "id": "FS", "severity": "OK", "finding": "offered" },
+        { "id": "FS_ECDHE_curves", "severity": "OK", "finding": "prime256v1 secp384r1 X25519" },
+        { "id": "DH_groups", "severity": "OK", "finding": "ffdhe2048 ffdhe3072" },
+        { "id": "FS_TLS12_sig_algs", "severity": "INFO", "finding": "RSA-PSS-RSAE+SHA256 RSA+SHA256" },
+        { "id": "FS_TLS13_sig_algs", "severity": "INFO", "finding": "RSA-PSS-RSAE+SHA256" }
+      ],
+      "serverDefaults": [
+        { "id": "TLS_extensions", "severity": "INFO", "finding": "'session ticket/#35' 'supported versions/#43' 'key share/#51'" },
+        { "id": "TLS_session_ticket", "severity": "INFO", "finding": "valid for 7200 seconds" },
+        { "id": "SSL_sessionID_support", "severity": "INFO", "finding": "yes" },
+        { "id": "sessionresumption_ticket", "severity": "OK", "finding": "supported" },
+        { "id": "sessionresumption_ID", "severity": "OK", "finding": "supported" },
+        { "id": "cert", "severity": "INFO", "finding": "-----BEGIN CERTIFICATE-----\nSANITIZED-FIXTURE\n-----END CERTIFICATE-----" },
+        { "id": "cert_numbers", "severity": "INFO", "finding": "2" },
+        { "id": "cert_signatureAlgorithm", "severity": "OK", "finding": "SHA256 with RSA" },
+        { "id": "cert_keySize", "severity": "INFO", "finding": "RSA 2048 bits" },
+        { "id": "cert_commonName", "severity": "OK", "finding": "example.com" },
+        { "id": "cert_subjectAltName", "severity": "OK", "finding": "example.com www.example.com" },
+        { "id": "cert_trust", "severity": "OK", "finding": "passed" },
+        { "id": "cert_chain_of_trust", "severity": "OK", "finding": "passed" },
+        { "id": "cert_expirationStatus", "severity": "OK", "finding": "expires in 90 days" },
+        { "id": "OCSP_stapling", "severity": "OK", "finding": "offered" },
+        { "id": "certs_list_ordering_problem", "severity": "OK", "finding": "no" }
+      ],
+      "vulnerabilities": [
+        { "id": "heartbleed", "severity": "CRITICAL", "cve": "CVE-2014-0160", "finding": "vulnerable" },
+        { "id": "CCS", "severity": "OK", "cve": "CVE-2014-0224", "finding": "not vulnerable" },
+        { "id": "ticketbleed", "severity": "OK", "cve": "CVE-2016-9244", "finding": "not vulnerable" },
+        { "id": "ROBOT", "severity": "OK", "cve": "CVE-2017-13099", "finding": "not vulnerable" },
+        { "id": "secure_renego", "severity": "OK", "finding": "supported" },
+        { "id": "secure_client_renego", "severity": "OK", "finding": "not vulnerable" },
+        { "id": "CRIME_TLS", "severity": "OK", "finding": "not vulnerable" },
+        { "id": "POODLE_SSL", "severity": "OK", "finding": "not vulnerable" },
+        { "id": "fallback_SCSV", "severity": "OK", "finding": "no protocol below TLS 1.2 offered" },
+        { "id": "SWEET32", "severity": "OK", "finding": "not vulnerable" },
+        { "id": "FREAK", "severity": "OK", "finding": "not vulnerable" },
+        { "id": "DROWN", "severity": "OK", "finding": "not vulnerable on this host and port" },
+        { "id": "LOGJAM", "severity": "OK", "finding": "not vulnerable" },
+        { "id": "BEAST", "severity": "OK", "finding": "not vulnerable" },
+        { "id": "LUCKY13", "severity": "OK", "finding": "not vulnerable" },
+        { "id": "RC4", "severity": "OK", "finding": "not vulnerable" }
+      ],
+      "browserSimulations": [
+        { "id": "clientsimulation-chrome_current", "severity": "INFO", "finding": "TLSv1.3 TLS_AES_128_GCM_SHA256" },
+        { "id": "clientsimulation-ie_8_win7", "severity": "INFO", "finding": "No connection" }
+      ]
+    }
+  ]
+}

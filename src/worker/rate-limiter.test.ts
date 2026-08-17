@@ -1,12 +1,20 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   canonicalizeClientIp,
   digestClientIp,
+  evaluateSecurityAssessmentPollWindow,
   evaluateWebScanWindow,
   RateLimitConfigurationError,
+  SECURITY_ASSESSMENT_POLL_LIMIT,
+  SECURITY_ASSESSMENT_POLL_WINDOW_MS,
   WEB_SCAN_LIMIT,
   WEB_SCAN_WINDOW_MS,
+  WebScanRateLimiter,
 } from "./rate-limiter";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("web security scan rolling rate limit", () => {
   it("allows exactly five events in the preceding hour and denies the sixth", () => {
@@ -85,6 +93,45 @@ describe("web security scan rolling rate limit", () => {
   });
 });
 
+describe("assessment status rolling rate limit", () => {
+  it("allows the documented two-second UI cadence but rejects request 61 inside one minute", () => {
+    const start = Date.UTC(2026, 7, 16, 12, 0, 0);
+    let timestamps: number[] = [];
+
+    for (let attempt = 0; attempt < SECURITY_ASSESSMENT_POLL_LIMIT; attempt += 1) {
+      const decision = evaluateSecurityAssessmentPollWindow(timestamps, start + attempt * 500);
+      expect(decision.allowed).toBe(true);
+      timestamps = decision.timestamps;
+    }
+
+    const denied = evaluateSecurityAssessmentPollWindow(timestamps, start + 30_000);
+    expect(denied.allowed).toBe(false);
+    expect(denied.remaining).toBe(0);
+    expect(denied.retryAfterSeconds).toBe(30);
+
+    const afterBoundary = evaluateSecurityAssessmentPollWindow(timestamps, start + SECURITY_ASSESSMENT_POLL_WINDOW_MS);
+    expect(afterBoundary.allowed).toBe(true);
+  });
+
+  it("schedules expiry and deletes all per-IP state after its last rolling event expires", async () => {
+    vi.useFakeTimers();
+    const start = Date.UTC(2026, 7, 16, 12, 0, 0);
+    vi.setSystemTime(start);
+    const state = fakeRateLimiterState();
+    const limiter = new WebScanRateLimiter(state.durableState);
+
+    const response = await limiter.fetch(new Request("https://rate-limit.internal/consume", { method: "POST" }));
+    expect(response.status).toBe(200);
+    expect(state.setAlarm).toHaveBeenLastCalledWith(start + WEB_SCAN_WINDOW_MS + 1);
+
+    vi.setSystemTime(start + WEB_SCAN_WINDOW_MS + 1);
+    await limiter.alarm();
+    expect(state.deleteAll).toHaveBeenCalledOnce();
+    expect(state.tables.web_scan_events).toEqual([]);
+    expect(state.tables.assessment_poll_events).toEqual([]);
+  });
+});
+
 describe("trusted client IP keys", () => {
   it("canonicalizes equivalent IPv6 spellings and accepts a bare IPv4 address", () => {
     expect(canonicalizeClientIp("203.0.113.7")).toBe("203.0.113.7");
@@ -132,3 +179,74 @@ describe("trusted client IP keys", () => {
     await expect(digestClientIp("203.0.113.7", secret)).rejects.toBeInstanceOf(RateLimitConfigurationError);
   });
 });
+
+function fakeRateLimiterState(): {
+  durableState: DurableObjectState;
+  tables: Record<"web_scan_events" | "assessment_poll_events", number[]>;
+  setAlarm: ReturnType<typeof vi.fn>;
+  deleteAll: ReturnType<typeof vi.fn>;
+} {
+  const tables = {
+    web_scan_events: [] as number[],
+    assessment_poll_events: [] as number[],
+  };
+  let alarmAt: number | null = null;
+  const sql = {
+    exec(query: string, ...bindings: unknown[]) {
+      const normalized = query.replace(/\s+/gu, " ").trim();
+      const table = normalized.includes("assessment_poll_events")
+        ? "assessment_poll_events"
+        : "web_scan_events";
+      if (normalized.startsWith("SELECT occurred_at")) {
+        return tables[table].map((occurred_at) => ({ occurred_at }));
+      }
+      if (normalized.startsWith("SELECT COUNT(*)")) {
+        return [{
+          count: tables[table].length,
+          oldest: tables[table].length > 0 ? Math.min(...tables[table]) : null,
+        }];
+      }
+      if (normalized.startsWith("SELECT MIN(occurred_at)")) {
+        const cutoff = normalized.includes("WHERE") ? Number(bindings[0]) : Number.NEGATIVE_INFINITY;
+        const now = normalized.includes("WHERE") ? Number(bindings[1]) : Number.POSITIVE_INFINITY;
+        const active = tables[table].filter((timestamp) => timestamp > cutoff && timestamp <= now);
+        return [{ oldest: active.length > 0 ? Math.min(...active) : null }];
+      }
+      if (normalized.startsWith("DELETE FROM")) {
+        if (normalized.includes("WHERE occurred_at <= ? OR occurred_at > ?")) {
+          const cutoff = Number(bindings[0]);
+          const now = Number(bindings[1]);
+          tables[table] = tables[table].filter((timestamp) => timestamp > cutoff && timestamp <= now);
+        } else {
+          tables[table] = [];
+        }
+      } else if (normalized.startsWith("INSERT INTO")) {
+        tables[table].push(Number(bindings[0]));
+      }
+      return [];
+    },
+  };
+  const setAlarm = vi.fn(async (value: number) => {
+    alarmAt = value;
+  });
+  const deleteAll = vi.fn(async () => {
+    tables.web_scan_events = [];
+    tables.assessment_poll_events = [];
+    alarmAt = null;
+  });
+  const storage = {
+    sql,
+    transactionSync<T>(callback: () => T): T {
+      return callback();
+    },
+    setAlarm,
+    getAlarm: vi.fn(async () => alarmAt),
+    deleteAll,
+  };
+  return {
+    durableState: { storage } as unknown as DurableObjectState,
+    tables,
+    setAlarm,
+    deleteAll,
+  };
+}

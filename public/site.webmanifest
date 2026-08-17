@@ -1,7 +1,7 @@
 {
-  "name": "DMARC Ready",
-  "short_name": "DMARC Ready",
-  "description": "Read-only email authentication and DMARC configuration scanner.",
+  "name": "Cresswell Security Lab",
+  "short_name": "Cresswell Lab",
+  "description": "Evidence-first public-surface security assessment across email, DNS, networks, web, and TLS.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#f5f8f5",

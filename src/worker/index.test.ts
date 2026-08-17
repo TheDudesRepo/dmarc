@@ -1,7 +1,7 @@
 import dns from "node:dns";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WEB_SECURITY_DISCLAIMER } from "../shared/types";
-import worker, { createWorker } from "./index";
+import worker, { createPinnedLegacyWebSecurityScanner, createWorker } from "./index";
 import { WebSecurityTargetError, type WebSecurityScanExecution } from "./web-security";
 
 const env = {
@@ -19,19 +19,38 @@ describe("Worker API boundary", () => {
     vi.restoreAllMocks();
   });
 
+  it("forces the compatibility web route through the pinned socket fetcher without a global fallback", async () => {
+    const pinnedFetcher = vi.fn();
+    const scanner = vi.fn(async () => ({} as WebSecurityScanExecution));
+    const compatibilityScanner = createPinnedLegacyWebSecurityScanner(
+      scanner as never,
+      () => pinnedFetcher as never,
+    );
+
+    await compatibilityScanner("example.com");
+
+    expect(scanner).toHaveBeenCalledWith("example.com", { fetcher: pinnedFetcher });
+  });
+
   it("returns a health response with hardened headers", async () => {
     const response = await worker.fetch(new Request("https://scanner.example/api/health"), env);
     const body = (await response.json()) as { status: string; version: string; deploymentId: string | null };
 
     expect(response.status).toBe(200);
-    expect(body).toEqual(expect.objectContaining({ status: "ok", version: "0.4.0", deploymentId: null }));
+    expect(body).toEqual(expect.objectContaining({
+      status: "ok",
+      service: "cresswell-security-lab",
+      version: "0.5.0",
+      deploymentId: null,
+    }));
     expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.headers.get("cache-control")).toContain("no-store");
   });
 
-  it("returns the rolling web-scan quota with an epoch RateLimit-Reset header", async () => {
+  it("returns the rolling web-scan quota with a relative RateLimit-Reset header", async () => {
     const resetAt = "2026-08-16T15:30:00.250Z";
+    const now = Date.parse("2026-08-16T14:30:00.250Z");
     const scanResult = {
       hostname: "example.com",
       effectiveUrl: "https://example.com/",
@@ -65,6 +84,7 @@ describe("Worker API boundary", () => {
         retryAfterSeconds: 0,
         timestamps: [Date.parse("2026-08-16T14:30:00.250Z")],
       }),
+      now: () => now,
     });
     const response = await webWorker.fetch(
       new Request("https://scanner.example/api/web-security", {
@@ -85,7 +105,7 @@ describe("Worker API boundary", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("ratelimit-limit")).toBe("5");
     expect(response.headers.get("ratelimit-remaining")).toBe("4");
-    expect(response.headers.get("ratelimit-reset")).toBe(String(Math.ceil(Date.parse(resetAt) / 1_000)));
+    expect(response.headers.get("ratelimit-reset")).toBe("3600");
     expect(scan).toHaveBeenCalledWith("example.com");
     await expect(response.json()).resolves.toEqual(expect.objectContaining({
       hostname: "example.com",
@@ -96,6 +116,7 @@ describe("Worker API boundary", () => {
   it("returns quota and delta Retry-After headers without scanning when the web quota is exhausted", async () => {
     const scan = vi.fn();
     const resetAt = "2026-08-16T15:30:00.250Z";
+    const now = Date.parse(resetAt) - 725_000;
     const webWorker = createWorker({
       scanWebSecurity: scan,
       consumeWebScanQuota: async () => ({
@@ -104,6 +125,7 @@ describe("Worker API boundary", () => {
         retryAfterSeconds: 725,
         timestamps: [1, 2, 3, 4, 5],
       }),
+      now: () => now,
     });
     const response = await webWorker.fetch(
       new Request("https://scanner.example/api/web-security", {
@@ -121,7 +143,7 @@ describe("Worker API boundary", () => {
     expect(response.status).toBe(429);
     expect(response.headers.get("ratelimit-limit")).toBe("5");
     expect(response.headers.get("ratelimit-remaining")).toBe("0");
-    expect(response.headers.get("ratelimit-reset")).toBe(String(Math.ceil(Date.parse(resetAt) / 1_000)));
+    expect(response.headers.get("ratelimit-reset")).toBe("725");
     expect(response.headers.get("retry-after")).toBe("725");
     expect(scan).not.toHaveBeenCalled();
     await expect(response.json()).resolves.toEqual({

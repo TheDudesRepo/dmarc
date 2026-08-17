@@ -1,0 +1,13 @@
+{
+  "name": "cresswell-tls-scanner-container",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node --test --test-reporter=spec test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

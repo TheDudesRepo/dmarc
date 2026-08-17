@@ -14,7 +14,6 @@ import {
   Database,
   ExternalLink,
   FileSearch,
-  Fingerprint,
   Globe2,
   Info,
   KeyRound,
@@ -436,16 +435,16 @@ const severityIcons: Record<FindingSeverity, ReactNode> = {
 };
 
 function scrollToScanner() {
-  document.getElementById("scanner")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  document.getElementById("email-security")?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function Brand() {
   return (
-    <a className="brand" href="#top" aria-label="DMARC Ready home">
+    <a className="brand" href="#top" aria-label="Cresswell Security Lab home">
       <span className="brand-mark" aria-hidden="true">
-        <ShieldCheck />
+        <Radar />
       </span>
-      <span>DMARC<span>Ready</span></span>
+      <span>Cresswell <span>Security Lab</span></span>
     </a>
   );
 }
@@ -456,26 +455,24 @@ function Header() {
       <div className="container header-inner">
         <Brand />
         <nav className="desktop-nav" aria-label="Primary navigation">
-          <a href="#dns-explorer">DNS tools</a>
-          <a href="#dns-surface">Surface scan</a>
-          <a href="#web-security">Web security</a>
-          <a href="#ip-tools">IP tools</a>
+          <a href="#email-security">Email Security</a>
+          <a href="#dns-intelligence">DNS &amp; OSINT</a>
+          <a href="#network-intelligence">Network Intelligence</a>
+          <a href="#web-security">Web &amp; TLS</a>
           <a href="#methodology">Methodology</a>
-          <a href="#roadmap">Roadmap</a>
         </nav>
         <details className="mobile-nav">
-          <summary><Menu aria-hidden="true" /> Tools</summary>
+          <summary><Menu aria-hidden="true" /> Explore</summary>
           <nav aria-label="Mobile navigation">
-            <a href="#dns-explorer" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>DNS tools</a>
-            <a href="#dns-surface" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Surface scan</a>
-            <a href="#web-security" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Web security</a>
-            <a href="#ip-tools" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>IP tools</a>
+            <a href="#email-security" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Email Security</a>
+            <a href="#dns-intelligence" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>DNS &amp; OSINT</a>
+            <a href="#network-intelligence" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Network Intelligence</a>
+            <a href="#web-security" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Web &amp; TLS</a>
             <a href="#methodology" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Methodology</a>
-            <a href="#roadmap" onClick={(event) => event.currentTarget.closest("details")?.removeAttribute("open")}>Roadmap</a>
           </nav>
         </details>
         <button className="button button-small button-quiet" type="button" onClick={scrollToScanner}>
-          Scan a domain <ArrowRight aria-hidden="true" />
+          Start assessment <ArrowRight aria-hidden="true" />
         </button>
       </div>
     </header>
@@ -543,17 +540,19 @@ function Hero({
   error: string | null;
 }) {
   return (
-    <section className="hero" id="scanner">
+    <section className="hero" id="email-security">
       <div className="hero-grid" aria-hidden="true" />
       <div className="orb orb-one" aria-hidden="true" />
       <div className="orb orb-two" aria-hidden="true" />
       <div className="container hero-inner">
-        <div className="eyebrow"><span /> Free email authentication check</div>
-        <h1>Know what stands between your domain and <em>enforcement.</em></h1>
+        <div className="eyebrow"><span /> Cresswell Security Lab · public-surface assessment</div>
+        <h1>See what the <em>internet sees.</em></h1>
         <p className="hero-copy">
-          Inspect DMARC, SPF, discoverable DKIM, DNS health, and mail transport controls in seconds.
-          Get a clear explanation of what is configured, what is exposed, and what to fix next.
+          Measure the public security posture of a hostname across email authentication, DNS and OSINT,
+          network intelligence, and web transport. Every result separates direct tests, bounded inferences,
+          and evidence the platform could not observe.
         </p>
+        <div className="hero-family-label"><MailCheck aria-hidden="true" /><span><strong>Email Security quick assessment</strong><small>Start with DMARC, SPF, discoverable DKIM, DNS health, and mail transport policy.</small></span></div>
         <div className="hero-scanner">
           <ScanForm
             domain={domain}
@@ -564,7 +563,7 @@ function Hero({
           <div className="scan-meta" id="domain-help">
             <span><LockKeyhole aria-hidden="true" /> No account required</span>
             <span><Clock3 aria-hidden="true" /> Usually under 10 seconds</span>
-            <span><Database aria-hidden="true" /> Public DNS data only</span>
+            <span><Database aria-hidden="true" /> Public evidence</span>
           </div>
           {error && (
             <div className="form-error" role="alert">
@@ -583,11 +582,99 @@ function Hero({
         </div>
       </div>
       <div className="container proof-strip" aria-label="Checks included">
-        <span><Fingerprint aria-hidden="true" /> DMARC policy</span>
-        <span><Network aria-hidden="true" /> SPF policy</span>
-        <span><KeyRound aria-hidden="true" /> DKIM discovery</span>
-        <span><MailCheck aria-hidden="true" /> Transport security</span>
-        <span><Globe2 aria-hidden="true" /> DNS health</span>
+        <span><MailCheck aria-hidden="true" /> Email Security</span>
+        <span><Globe2 aria-hidden="true" /> DNS &amp; OSINT</span>
+        <span><Network aria-hidden="true" /> Network Intelligence</span>
+        <span><ShieldCheck aria-hidden="true" /> Web &amp; TLS</span>
+        <span><FileSearch aria-hidden="true" /> Evidence-first reports</span>
+      </div>
+    </section>
+  );
+}
+
+const SECURITY_FAMILIES = [
+  {
+    href: "#email-security",
+    icon: <MailCheck />,
+    number: "01",
+    title: "Email Security",
+    copy: "DMARC, SPF, discoverable DKIM, MX, MTA-STS, TLS reporting, and enforcement readiness.",
+    badge: "Passive DNS",
+  },
+  {
+    href: "#dns-intelligence",
+    icon: <Globe2 />,
+    number: "02",
+    title: "DNS & OSINT",
+    copy: "Record exploration, bounded SPF expansion, service discovery, and a mapped public DNS surface.",
+    badge: "Passive-style",
+  },
+  {
+    href: "#network-intelligence",
+    icon: <Network />,
+    number: "03",
+    title: "Network Intelligence",
+    copy: "Address classification, subnet arithmetic, reverse DNS, routing-origin evidence, and scope context.",
+    badge: "Local + DNS",
+  },
+  {
+    href: "#web-security",
+    icon: <ShieldCheck />,
+    number: "04",
+    title: "Web & TLS",
+    copy: "Authorized endpoint TLS analysis plus 20 OWASP-aligned browser and HTTP configuration checks.",
+    badge: "Authorized active",
+  },
+] as const;
+
+function SecurityFamilies() {
+  return (
+    <section className="security-families" aria-labelledby="security-families-title">
+      <div className="container">
+        <div className="security-families-heading">
+          <div><div className="eyebrow"><span /> One public surface, four lenses</div><h2 id="security-families-title">A cohesive assessment workspace.</h2></div>
+          <p>Move from a broad hostname to the exact evidence you need. Each family keeps its own safety boundary and explains what was measured.</p>
+        </div>
+        <div className="security-family-grid">
+          {SECURITY_FAMILIES.map((family) => (
+            <a href={family.href} key={family.title}>
+              <span className="family-number">{family.number}</span>
+              <span className="family-icon" aria-hidden="true">{family.icon}</span>
+              <small>{family.badge}</small>
+              <h3>{family.title}</h3>
+              <p>{family.copy}</p>
+              <strong>Open workspace <ArrowRight aria-hidden="true" /></strong>
+            </a>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function FamilyIntro({
+  id,
+  number,
+  icon,
+  eyebrow,
+  title,
+  copy,
+  badges,
+}: {
+  id: string;
+  number: string;
+  icon: ReactNode;
+  eyebrow: string;
+  title: string;
+  copy: string;
+  badges: string[];
+}) {
+  return (
+    <section className="family-intro" id={id} aria-labelledby={`${id}-title`}>
+      <div className="container family-intro-inner">
+        <div className="family-intro-index"><span>{number}</span>{icon}</div>
+        <div><div className="eyebrow"><span /> {eyebrow}</div><h2 id={`${id}-title`}>{title}</h2><p>{copy}</p></div>
+        <div className="family-intro-badges">{badges.map((badge) => <span key={badge}>{badge}</span>)}</div>
       </div>
     </section>
   );
@@ -1234,12 +1321,12 @@ export function AdvancedDnsExplorer({ suggestedDomain }: { suggestedDomain: stri
       <div className="container">
         <div className="dns-explorer-heading">
           <div>
-            <div className="eyebrow"><span /> DNS and SPF explorer</div>
+            <div className="eyebrow"><span /> DNS &amp; OSINT · exact lookup</div>
             <h2 id="dns-explorer-title">Inspect a record or analyze the bounded SPF path.</h2>
           </div>
           <p>
             Query a specific public DNS owner or select SPF for a recursive policy analysis with
-            correction steps. These results remain separate from the domain readiness score above.
+            correction steps. These results remain separate from the Email Security score above.
           </p>
         </div>
 
@@ -1428,29 +1515,29 @@ function HowItWorks() {
     {
       icon: <Globe2 />,
       number: "01",
-      title: "Resolve",
-      copy: "Query authoritative public records through encrypted DNS. Nothing is installed and no email is sent.",
+      title: "Define the surface",
+      copy: "Start with one public hostname or address. Each workspace applies a strict input and authorization boundary.",
     },
     {
       icon: <FileSearch />,
       number: "02",
-      title: "Explain",
-      copy: "Parse policy tags, alignment modes, reporting destinations, SPF paths, and discoverable supporting controls.",
+      title: "Collect evidence",
+      copy: "Run deterministic DNS analysis, local network calculations, or explicitly authorized web and TLS probes.",
     },
     {
       icon: <Route />,
       number: "03",
-      title: "Prioritize",
-      copy: "Turn protocol details into an ordered remediation path while clearly separating evidence from assumptions.",
+      title: "Prioritize safely",
+      copy: "Turn observations into an ordered remediation path while separating direct tests, inferences, and unknowns.",
     },
   ];
   return (
     <section className="how-section" id="how-it-works">
       <div className="container">
         <div className="center-heading">
-          <div className="eyebrow"><span /> Clear by design</div>
-          <h2>From DNS records to a usable answer.</h2>
-          <p>No wall of XML. No mystery score. Every recommendation is tied to evidence found during the scan.</p>
+          <div className="eyebrow"><span /> One evidence model</div>
+          <h2>From public surface to a defensible answer.</h2>
+          <p>No mystery score and no implied coverage. Every recommendation stays tied to evidence the assessment could actually collect.</p>
         </div>
         <div className="steps-grid">
           {steps.map((step, index) => (
@@ -1470,22 +1557,22 @@ function HowItWorks() {
 
 function Methodology() {
   const principles = [
-    [<BadgeCheck />, "Evidence first", "Scores are derived from observable DNS configuration, with raw records available for inspection."],
-    [<Shield />, "Safe by default", "A DNS snapshot never claims a domain is safe to enforce without aggregate-report history."],
-    [<Waypoints />, "Standards aligned", "Analysis follows current DMARC deployment concepts while preserving compatibility with deployed records."],
+    [<BadgeCheck />, "Evidence first", "Scores and grades are derived from bounded observations with raw records, endpoint details, or explicit unknown states."],
+    [<Shield />, "Safe by default", "Passive tools stay passive-style; active web and TLS work requires authorization and server-enforced abuse controls."],
+    [<Waypoints />, "Standards aligned", "Email, DNS, network, HTTP, OWASP, and TLS language follows the relevant standards without claiming compliance."],
   ] as const;
   return (
     <section className="methodology-section" id="methodology">
       <div className="container methodology-grid">
         <div>
           <div className="eyebrow"><span /> Methodology</div>
-          <h2>Built for decisions—not just dashboards.</h2>
+          <h2>Measurement before certainty.</h2>
           <p>
-            This first release is intentionally deterministic. It evaluates public configuration and
-            calls out uncertainty instead of pretending a DNS record proves every legitimate sender is aligned.
+            Cresswell Security Lab uses deterministic checks and bounded active probes. It calls out
+            uncertainty instead of turning unavailable evidence into a pass, a failure, or a compliance claim.
           </p>
-          <a href="https://datatracker.ietf.org/doc/rfc9989/" target="_blank" rel="noreferrer">
-            Read the current DMARC standard <ExternalLink aria-hidden="true" />
+          <a href="https://owasp.org/www-project-web-security-testing-guide/" target="_blank" rel="noreferrer">
+            Explore the OWASP testing guide <ExternalLink aria-hidden="true" />
           </a>
         </div>
         <div className="principles-list">
@@ -1503,11 +1590,11 @@ function Roadmap() {
     <section className="roadmap-section" id="roadmap">
       <div className="container roadmap-card">
         <div>
-          <div className="eyebrow eyebrow-light"><span /> Coming next</div>
-          <h2>A scanner today. An enforcement copilot tomorrow.</h2>
+          <div className="eyebrow eyebrow-light"><span /> Operational direction</div>
+          <h2>Point-in-time evidence, designed to become a posture history.</h2>
           <p>
-            Planned capabilities include DMARC aggregate-report ingestion, sender ownership workflows,
-            historical change detection, multi-domain portfolios, and guided movement to quarantine.
+            The platform is structured for historical change detection, multi-domain portfolios,
+            deeper authorized testing, and evidence-backed remediation workflows without weakening current safety boundaries.
           </p>
         </div>
         <div className="roadmap-visual" aria-hidden="true">
@@ -1522,8 +1609,8 @@ function Footer() {
   return (
     <footer>
       <div className="container footer-inner">
-        <div><Brand /><p>Clear evidence. Safer enforcement.</p></div>
-        <p>DMARC Ready provides technical analysis, not a guarantee of mail delivery or security.</p>
+        <div><Brand /><p>See what the internet sees.</p></div>
+        <p>Cresswell Security Lab provides bounded technical observations, not proof of security, vulnerability, or compliance.</p>
         <a href="#top">Back to top <ArrowRight aria-hidden="true" /></a>
       </div>
     </footer>
@@ -1638,10 +1725,29 @@ export default function App() {
             error={error}
           />
         )}
+        <SecurityFamilies />
+        <FamilyIntro
+          id="dns-intelligence"
+          number="02"
+          icon={<Globe2 />}
+          eyebrow="DNS & OSINT"
+          title="Interrogate the public naming layer."
+          copy="Resolve exact records, expand SPF safely, and map a bounded DNS surface without crawling services or guessing hidden names."
+          badges={["Public DNS", "Bounded discovery", "Raw evidence"]}
+        />
         <AdvancedDnsExplorer suggestedDomain={result?.domain ?? ""} />
         <DnsSurfaceScanner suggestedDomain={result?.domain ?? ""} />
-        <WebSecurityScanner suggestedDomain={result?.domain ?? ""} />
+        <FamilyIntro
+          id="network-intelligence"
+          number="03"
+          icon={<Network />}
+          eyebrow="Network Intelligence"
+          title="Put an address in operational context."
+          copy="Calculate exact networks and usable ranges, classify special-use space, and inspect reverse-DNS and routing-origin evidence for one address."
+          badges={["No port scan", "Local arithmetic", "DNS enrichment"]}
+        />
         <IpNetworkTool />
+        <WebSecurityScanner suggestedDomain={result?.domain ?? ""} />
         <HowItWorks />
         <Methodology />
         <Roadmap />

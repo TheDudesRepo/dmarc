@@ -150,7 +150,7 @@ export function IpNetworkTool() {
       <div className="container">
         <div className="ip-tool-heading">
           <div>
-            <div className="eyebrow"><span /> IP and subnet tools</div>
+            <div className="eyebrow"><span /> Network Intelligence · address context</div>
             <h2 id="ip-tool-title">Calculate the network. Inspect the DNS evidence.</h2>
           </div>
           <p>

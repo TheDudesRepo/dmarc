@@ -2,7 +2,7 @@
 
 ## Release boundary
 
-DMARC Ready is an email-authentication scanner plus a bounded public-DNS evidence toolbox. The supported release surface is defined by the API routes, not by experimental source files, tests, or the feature sets of third-party websites.
+Cresswell Security Lab has four supported families: Email Security, DNS & OSINT, Network Intelligence, and Web & TLS. The first three remain DNS/local-analysis oriented; Web & TLS is the one consent-gated active family. The release surface is defined by the routes and fixed profiles below, not by third-party product feature lists.
 
 | Capability | Release status | Scope |
 | --- | --- | --- |
@@ -12,8 +12,8 @@ DMARC Ready is an email-authentication scanner plus a bounded public-DNS evidenc
 | Apex DNS snapshot | Available | Explicit A, AAAA, CAA, CNAME, MX, NS, SOA, TXT and four email-security TXT owner names |
 | Common-host discovery | Available | Two fixed seven-label profiles, bounded CNAME/address resolution, one random wildcard control per profile |
 | IP/CIDR utility | Available | UI and API for local IPv4/IPv6 network calculation; bounded PTR and Team Cymru DNS evidence only for one global address |
-| Web/TLS posture scan | Available with explicit consent and quota | One hostname; fixed HTTP/HTTPS root and generated not-found observations; exactly 20 OWASP-aligned checks; bounded TLS profiles on port 443 |
-| General active network/security tools | Deliberately excluded | No arbitrary ports/URLs/paths/methods/payloads, vulnerability exploits, ping, traceroute, AXFR, banners, crawling, login, or SMTP handshakes |
+| Combined Web & TLS assessment | Available with deep consent and quota | One hostname/job; exactly 20 OWASP-aligned web controls plus up to four endpoint-level fixed `testssl.sh` profiles on port 443 |
+| General active network/security tools | Deliberately excluded | No arbitrary ports/URLs/paths/methods/payloads, denial-of-service work, ping, traceroute, AXFR, crawling, login, or SMTP handshakes |
 
 ## What “DNS surface” means here
 
@@ -25,7 +25,7 @@ The surface view consists of three independently budgeted requests:
 
 Each result remains tied to the exact owner name and query type used. `found`, `empty`, and `unavailable` are separate states. A random label is used to tag candidate answers that match likely wildcard DNS. Partial results remain visible, and an unavailable query does not become evidence that a record or hostname is missing.
 
-“Passive-style” describes the DNS surface, not the whole product. DNS operators may observe the Worker's fixed-recursive-resolver queries. The IP utility similarly performs local arithmetic and, for one global address, reverse and Team Cymru attribution DNS; it does not connect to supplied or returned addresses. The separately labeled web-security scan intentionally generates a small amount of HTTP/HTTPS/TLS traffic only after consent and quota enforcement.
+“Passive-style” describes the DNS surface, not the whole product. DNS operators may observe resolver queries. The IP utility does not connect to supplied addresses. The separately labeled combined assessment intentionally generates bounded HTTP and potentially hundreds of TLS handshakes, including selected cryptographic flaw probes, only after consent and quota enforcement.
 
 ## IP/CIDR utility boundary
 
@@ -43,17 +43,19 @@ DNS is a mapping from already-known owner names to typed records. Ordinary publi
 - Wildcard detection explains repeated catch-all answers; it does not prove that every matching name is synthetic.
 - No AXFR is attempted, even when a server might be misconfigured to allow it.
 
-DNSDumpster-style inventory may combine live DNS with certificate-transparency records, historical/passive-DNS databases, search engines, reverse datasets, and other third-party sources. This release integrates none of those datasets. DMARC Ready must therefore be described as a bounded live DNS observation, never as a complete zone inventory or a DNSDumpster equivalent.
+DNSDumpster-style inventory may combine live DNS with certificate-transparency records, historical/passive-DNS databases, search engines, reverse datasets, and other third-party sources. This release integrates none of those datasets. Cresswell Security Lab must therefore be described as a bounded live DNS observation, never as a complete zone inventory or a DNSDumpster equivalent.
 
-## Narrow web/TLS exception
+## Fixed Web & TLS active exception
 
-`POST /api/web-security` accepts a hostname, `authorizedUse: true`, and disclaimer version `2026-08-16`; it never accepts a URL, path, port, credentials, method, body, or wordlist. It makes one non-following `HEAD` request at the HTTP root, starts a manual `GET` chain at the HTTPS root with at most two redirects between the exact hostname and its direct `www` counterpart, observes fixed OPTIONS behavior, and requests one unpredictable generated not-found path. Work is capped at six HTTP requests, 2.5 seconds per fetch/body read, 30 seconds overall, and 131,072 bytes per inspected root/error response.
+`POST /api/security-assessments` accepts a hostname, `authorizedUse: true`, and disclaimer version `2026-08-16-deep-v1`; it never accepts a URL, address, path, port, credential, method, body, wordlist, scanner flag, or command. It returns one asynchronous combined job. HTTP work is capped at six requests, two redirects, 2.5 seconds per request/body read, 30 seconds overall, and 131,072 bytes per inspected response.
 
-All A/AAAA answers must be globally routable, are capped at 16, and are checked before and after each fetch; an address-set change or unsafe redirect fails closed. Cloudflare external `fetch` cannot be pinned to an arbitrary prevalidated address while preserving Host/SNI, so pre/post checks detect rebinding but cannot undo a platform request if DNS changed only during that lookup. The deployment uses no private VPC binding. TLS is IP-addressed with SNI, samples at most two representative endpoints and six fixed handshakes per ready endpoint, and reports Cloudflare socket-policy blocks as unavailable.
+All A/AAAA answers must be public and are capped at 16. Web requests prefer exact-IP raw sockets; the disclosed Cloudflare-fetch fallback gets fresh public-DNS checks before and after but retains a rebinding timing limitation. Deep TLS selects at most four representative A/AAAA endpoints and revalidates each exact address immediately before its scan. A separate fixed-image container runs identity, cryptography, and compatibility phases with 180 seconds, three concurrent fixed testssl parent runners under a UID-wide 48-process ceiling, five concurrent/128 total connections, 393,216 phase-output bytes, and 163,840 response bytes per endpoint.
 
-The web analyzer returns exactly 20 deterministic header, cookie, bounded-HTML, redirect, method, and error-response observations. OWASP Top 10 (2025) and WSTG references are contextual mappings, not official OWASP tooling or complete vulnerability coverage. The TLS snapshot similarly is not an SSL Labs equivalent; it does not enumerate all ciphers/clients or send vulnerability payloads. An SSL Labs link is a user-controlled handoff, not a proxied Qualys API call.
+The web analyzer returns exactly 20 deterministic header, cookie, bounded-HTML, redirect, method, and error-response observations. OWASP references are contextual mappings, not official tooling or complete coverage. TLS uses a version-pinned safe `testssl.sh` profile with bounded Heartbleed, CCS-injection, Ticketbleed, and ROBOT probes plus client simulations. It is an independent Cresswell methodology, not an SSL Labs grade; no Qualys API is called.
 
-One SQLite Durable Object per canonical Cloudflare client-IP digest enforces exactly five accepted attempts in the preceding rolling hour. Raw IPs are not stored in Durable Object state; a domain-separated SHA-256 object name is used by default and HMAC-SHA-256 is available with an optional 32-or-more-character secret. The attestation and quota reduce casual abuse but do not prove ownership or identity.
+One SQLite Durable Object per canonical Cloudflare client-IP digest enforces exactly five accepted combined-or-legacy starts in the preceding rolling hour. A global coordinator provides target single-flight, six-hour cache reuse without report copies, concurrency two, at most eight pending jobs, at most 256 retained rows, 25-minute stale-job recovery, creator-token cancellation, and 24-hour expiry. Every accepted POST consumes one quota slot even if it reuses cached/in-flight evidence. The attestation and quota reduce casual abuse but do not prove ownership or identity.
+
+Cloudflare Containers require internet capability for opaque raw TCP; `allowedHosts` does not constrain `net.connect`. The trusted image therefore forces `testssl.sh` through a local proxy that dials only the freshly validated exact IP:443, disables its own DNS/phone-home behavior, and exposes no caller-selected command. This is a material control but leaves residual container network capability and fixed-image trust.
 
 ## Why broader HackerTarget-like active tools are excluded
 
@@ -66,7 +68,7 @@ Port scans, vulnerability scans, ping, traceroute, AXFR attempts, banner collect
 - Vulnerability labels can be misleading without version validation, context, and controlled evidence retention.
 - Cloudflare Worker runtime/network behavior is not an authorization or isolation boundary for arbitrary probing.
 
-For those reasons these broader capabilities are not implemented as anonymous convenience endpoints and are not simulated with misleading DNS-only substitutes. The fixed web/TLS workflow does not satisfy the authorization, isolation, and operations needed for higher-impact probing.
+For those reasons broader capabilities are not anonymous convenience endpoints. The fixed assessment does not authorize arbitrary or higher-impact probing.
 
 ## Gate for a broader active-scanning plane
 
@@ -82,4 +84,4 @@ Any future active tool must be a separately reviewed and deployed system. Before
 8. Bounded execution time, redirects, response bytes, output records, retention, and access to results.
 9. Audit logs, operator monitoring, abuse reporting, incident response, and legal/policy review.
 
-Until that gate is met, the safe public boundary remains normalized, allowlisted DNS tooling plus the one fixed, consent-gated, five-per-IP/hour web/TLS observation workflow above.
+Until that gate is met, the public boundary remains normalized DNS/IP tooling plus the one fixed, consent-gated, five-per-IP/hour combined assessment above.

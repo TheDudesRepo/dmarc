@@ -9,10 +9,7 @@ import {
 import { calculateIpNetwork } from "./ip-tools";
 import { DnsClient } from "./dns";
 import { DomainValidationError, normalizeDomain } from "./domain";
-import {
-  scanTlsConfiguration,
-  type TlsScanExecution,
-} from "./tls-scanner";
+import type { TlsScanExecution } from "./tls-scanner";
 
 const MAX_HTTP_REQUESTS = 6;
 const MAX_REDIRECT_HOPS = 2;
@@ -26,10 +23,9 @@ const MAX_HTML_TAGS = 512;
 const FETCH_TIMEOUT_MS = 2_500;
 const MAX_SCAN_DURATION_MS = 30_000;
 const DNS_GUARD_TIMEOUT_MS = 1_500;
-const TLS_WORST_CASE_RESERVE_MS = 14_500;
 const TEST_ORIGIN = "https://scanner.invalid";
 const SCANNER_USER_AGENT =
-  "DMARCReady-WebSecurityScanner/0.4 (+https://dmarc.cresswell.rocks/security)";
+  "Cresswell-Security-Lab-WebScanner/0.5 (+https://dmarc.cresswell.rocks/security)";
 
 export { WEB_SECURITY_DISCLAIMER } from "../shared/types";
 
@@ -339,12 +335,8 @@ export async function scanWebSecurity(
     now,
     deadlineAt,
   });
-  const tlsExecution = deadlineAt - now() >= TLS_WORST_CASE_RESERVE_MS
-    ? await runTlsScan(
-      hostname,
-      initialAddresses,
-      options.tlsScanner ?? ((target, addresses) => scanTlsConfiguration(target, addresses, { now })),
-    )
+  const tlsExecution = options.tlsScanner
+    ? await runTlsScan(hostname, initialAddresses, options.tlsScanner)
     : {
       connectionCount: 0,
       assessment: unavailableTlsAssessment(hostname, initialAddresses),

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="DMARC Ready">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Cresswell Security Lab">
   <defs>
     <linearGradient id="g" x1="8" y1="5" x2="54" y2="58" gradientUnits="userSpaceOnUse">
       <stop stop-color="#22b985"/>
@@ -6,6 +6,8 @@
     </linearGradient>
   </defs>
   <rect width="64" height="64" rx="17" fill="#071f19"/>
-  <path d="M32 10 51 18v13c0 12.2-7.4 19.9-19 24-11.6-4.1-19-11.8-19-24V18l19-8Z" fill="url(#g)"/>
-  <path d="m23 32.5 6 6L42 25" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="32" cy="32" r="21" fill="url(#g)"/>
+  <circle cx="32" cy="32" r="13" fill="none" stroke="#fff" stroke-opacity=".7" stroke-width="2"/>
+  <path d="M32 32 45 21" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="32" cy="32" r="4" fill="#fff"/>
 </svg>

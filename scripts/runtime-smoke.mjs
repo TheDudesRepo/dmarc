@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { Log, LogLevel, Miniflare } from "miniflare";
 
@@ -19,6 +20,7 @@ const TYPE_CODES = {
 const TYPE_NAMES = Object.fromEntries(Object.entries(TYPE_CODES).map(([name, code]) => [String(code), name]));
 const outboundQueries = [];
 const wranglerConfig = JSON.parse(await readFile("wrangler.jsonc", "utf8"));
+const cloudflareRuntimeShim = fileURLToPath(new URL("../test/cloudflare-runtime-shim.ts", import.meta.url));
 
 const bundle = await build({
   entryPoints: ["src/worker/index.ts"],
@@ -27,6 +29,14 @@ const bundle = await build({
   platform: "browser",
   target: "es2022",
   external: ["node:dns", "node:tls"],
+  plugins: [{
+    name: "cloudflare-runtime-smoke-shim",
+    setup(context) {
+      context.onResolve({ filter: /^cloudflare:(sockets|workers|workflows)$/ }, () => ({
+        path: cloudflareRuntimeShim,
+      }));
+    },
+  }],
   logLevel: "silent",
   write: false,
 });
@@ -82,7 +92,11 @@ try {
   const health = await requestJson("/api/health");
   assert.equal(health.response.status, 200);
   assert.equal(health.body.status, "ok");
-  assert.equal(health.body.version, "0.4.0");
+  assert.equal(health.body.service, "cresswell-security-lab");
+  assert.equal(health.body.version, "0.5.0");
+  assert.ok(wranglerConfig.workflows.some(({ binding }) => binding === "SECURITY_ASSESSMENT_WORKFLOW"));
+  assert.ok(wranglerConfig.containers.some(({ class_name, max_instances }) =>
+    class_name === "DeepTlsScanner" && max_instances === 2));
 
   const webScanQueryStart = outboundQueries.length;
   const webScanWithoutRateLimitSetup = await postJson("/api/web-security", {

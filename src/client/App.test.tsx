@@ -84,14 +84,34 @@ afterEach(() => {
 });
 
 describe("application navigation", () => {
-  it("links the web-security scanner from desktop and compact navigation", () => {
+  it("presents the Cresswell brand and links all four assessment families from both navigation modes", () => {
     const { container } = render(<App />);
     const desktop = screen.getByRole("navigation", { name: "Primary navigation" });
     const mobile = screen.getByRole("navigation", { name: "Mobile navigation" });
 
-    expect(within(desktop).getByRole("link", { name: "Web security" }).getAttribute("href")).toBe("#web-security");
-    expect(within(mobile).getByRole("link", { name: "Web security" }).getAttribute("href")).toBe("#web-security");
+    expect(screen.getAllByRole("link", { name: "Cresswell Security Lab home" })).toHaveLength(2);
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("See what the internet sees.");
+    for (const [name, href] of [
+      ["Email Security", "#email-security"],
+      ["DNS & OSINT", "#dns-intelligence"],
+      ["Network Intelligence", "#network-intelligence"],
+      ["Web & TLS", "#web-security"],
+    ] as const) {
+      expect(within(desktop).getByRole("link", { name }).getAttribute("href")).toBe(href);
+      expect(within(mobile).getByRole("link", { name }).getAttribute("href")).toBe(href);
+      expect(container.querySelector(href)).not.toBeNull();
+    }
     expect(container.querySelector("#web-security")).not.toBeNull();
+  });
+
+  it("keeps the four family overview destinations and authorized Web & TLS boundary explicit", () => {
+    render(<App />);
+
+    const overview = screen.getByRole("heading", { name: "A cohesive assessment workspace." }).closest("section");
+    expect(overview).not.toBeNull();
+    expect(within(overview as HTMLElement).getAllByRole("link")).toHaveLength(4);
+    expect(screen.getByRole("heading", { name: "Inspect the transport edge, then go deeper." })).toBeTruthy();
+    expect(screen.getByText(/No credentials, injection payloads, authorization tests, or business-logic probes/u)).toBeTruthy();
   });
 });
 

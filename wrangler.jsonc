@@ -3,7 +3,7 @@
   "name": "dmarc",
   "main": "src/worker/index.ts",
   "compatibility_date": "2026-08-03",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
@@ -18,11 +18,47 @@
       {
         "name": "WEB_SCAN_RATE_LIMITER",
         "class_name": "WebScanRateLimiter"
+      },
+      {
+        "name": "SECURITY_ASSESSMENT_COORDINATOR",
+        "class_name": "SecurityAssessmentCoordinator"
+      },
+      {
+        "name": "DEEP_TLS_SCANNER",
+        "class_name": "DeepTlsScanner"
       }
     ]
   },
+  "workflows": [
+    {
+      "name": "cresswell-security-assessment",
+      "binding": "SECURITY_ASSESSMENT_WORKFLOW",
+      "class_name": "SecurityAssessmentWorkflow",
+      "limits": {
+        "steps": 32
+      }
+    }
+  ],
+  "containers": [
+    {
+      "name": "deep-tls-scanner",
+      "class_name": "DeepTlsScanner",
+      "image": "./scanner-container/Dockerfile",
+      "image_build_context": "./scanner-container",
+      "max_instances": 2,
+      "instance_type": "basic"
+    }
+  ],
   "exports": {
     "WebScanRateLimiter": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "SecurityAssessmentCoordinator": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "DeepTlsScanner": {
       "type": "durable-object",
       "storage": "sqlite"
     }

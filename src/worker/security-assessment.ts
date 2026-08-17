@@ -481,7 +481,11 @@ export class SecurityAssessmentCoordinator {
 
   private async handleComplete(jobId: string, request: Request): Promise<Response> {
     const payload = await readBoundedJson(request, MAX_INTERNAL_RESULT_BYTES);
-    if (!isPlainObject(payload) || !isSecurityAssessmentResult(payload.result)) {
+    if (!isPlainObject(payload)) {
+      return internalError("Invalid assessment result.", 400);
+    }
+    const result = repairLegacyBlankObservationSummaries(payload.result);
+    if (!isSecurityAssessmentResult(result)) {
       return internalError("Invalid assessment result.", 400);
     }
     const row = this.firstRow<JobRow>("SELECT * FROM security_assessment_jobs WHERE job_id = ? LIMIT 1", jobId);
@@ -490,7 +494,7 @@ export class SecurityAssessmentCoordinator {
       await this.disposeEndpointContainersBestEffort(jobId);
       return internalJson(rowToJob(row));
     }
-    if (payload.result.hostname !== row.hostname) return internalError("Invalid assessment result.", 400);
+    if (result.hostname !== row.hostname) return internalError("Invalid assessment result.", 400);
 
     const now = Date.now();
     this.sql.exec(
@@ -500,11 +504,11 @@ export class SecurityAssessmentCoordinator {
       now,
       now,
       JSON.stringify(completeProgress(
-        payload.result.tls.endpoints.length,
+        result.tls.endpoints.length,
         parseProgress(row.progress_json).totalEndpoints,
         now,
       )),
-      JSON.stringify(payload.result),
+      JSON.stringify(result),
       jobId,
     );
     // The per-endpoint release step is retried by Workflow, and terminal
@@ -1152,7 +1156,9 @@ function validateJobId(jobId: string): void {
 function rowToJob(row: JobRow): SecurityAssessmentJobResource {
   if (!isJobStatus(row.status)) throw new Error("Invalid stored job status.");
   const progressValue = parseProgress(row.progress_json);
-  const resultValue = row.result_json ? JSON.parse(row.result_json) as unknown : undefined;
+  const resultValue = row.result_json
+    ? repairLegacyBlankObservationSummaries(JSON.parse(row.result_json) as unknown)
+    : undefined;
   const errorValue = row.error_json ? JSON.parse(row.error_json) as unknown : undefined;
   if (resultValue !== undefined && !isSecurityAssessmentResult(resultValue)) throw new Error("Invalid stored job result.");
   if (errorValue !== undefined && !isJobError(errorValue)) throw new Error("Invalid stored job error.");
@@ -1171,6 +1177,37 @@ function rowToJob(row: JobRow): SecurityAssessmentJobResource {
     ...(resultValue ? { result: resultValue } : {}),
     ...(errorValue ? { error: errorValue } : {}),
   };
+}
+
+/**
+ * Reports created by the initial deep-scanner release could contain an empty
+ * informational finding when testssl.sh returned an explicit empty string.
+ * Repair only that legacy omission at ingress/read time so retained cache hits
+ * remain usable while every other report field still passes the strict schema.
+ */
+function repairLegacyBlankObservationSummaries(value: unknown): unknown {
+  if (!isPlainObject(value) || !isPlainObject(value.tls) || !Array.isArray(value.tls.endpoints)) return value;
+  for (const endpoint of value.tls.endpoints) {
+    if (!isPlainObject(endpoint) || !isPlainObject(endpoint.sections)) continue;
+    for (const section of Object.values(endpoint.sections)) {
+      if (!isPlainObject(section) || !Array.isArray(section.observations)) continue;
+      for (const observation of section.observations) {
+        if (
+          isPlainObject(observation)
+          && typeof observation.summary === "string"
+          && observation.summary.trim().length === 0
+          && observation.status === "info"
+          && observation.evidenceKind === "tested"
+          && observation.severity === "info"
+          && typeof observation.sourceId === "string"
+          && observation.sourceId.length > 0
+        ) {
+          observation.summary = "No bounded finding was returned.";
+        }
+      }
+    }
+  }
+  return value;
 }
 
 function queuedProgress(totalEndpoints: number, now: number): SecurityAssessmentProgress {
@@ -1544,7 +1581,8 @@ function isDeepTlsObservation(value: unknown): value is DeepTlsObservation {
     || !(["pass", "warning", "fail", "info", "unknown", "not-tested"] as const).includes(value.status as never)
     || !(["tested", "inferred", "not-testable"] as const).includes(value.evidenceKind as never)
     || !(["critical", "high", "medium", "low", "info", "none"] as const).includes(value.severity as never)
-    || !isBoundedString(value.summary, 384)) return false;
+    || !isBoundedString(value.summary, 384)
+    || value.summary.trim().length === 0) return false;
   return value.details === undefined || isDeepTlsDetails(value.details);
 }
 

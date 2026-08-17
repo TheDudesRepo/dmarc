@@ -65,6 +65,27 @@ test("normalizes structured evidence, active issues, grading, and exclusions", (
   assert.ok(Buffer.byteLength(JSON.stringify(result)) <= LIMITS.maximumResponseBytes);
 });
 
+test("replaces blank testssl findings with a bounded explanatory summary", () => {
+  const blankFinding = structuredClone(fixture);
+  blankFinding.scanResult[0].serverDefaults.push({
+    id: "certificate_compression",
+    severity: "INFO",
+    finding: " \t\n ",
+  });
+  const result = normalizeDeepTlsResult({
+    request,
+    phaseResults: phases(blankFinding),
+    connectionBudget: { opened: 1 },
+    startedAt: "2026-08-16T00:00:00.000Z",
+    durationMs: 1_000,
+  });
+  const observation = result.sections.certificate.observations.find((entry) =>
+    entry.sourceId === "certificate_compression");
+  assert.equal(observation?.summary, "No bounded finding was returned.");
+  assert.ok(Object.values(result.sections).every((section) =>
+    section.observations.every((entry) => entry.summary.length > 0)));
+});
+
 test("never reports complete when completed child output targets the wrong endpoint", () => {
   const wrong = structuredClone(fixture);
   wrong.scanResult[0].ip = "93.184.216.35";

@@ -64,6 +64,21 @@ describe("deep TLS response boundary", () => {
       address: "8.8.8.8",
       deadlineMs: 180_000,
     })).toThrow(/invalid report/u);
+
+    const blankInformation = structuredClone(report);
+    blankInformation.sections.certificate.observations[0] = {
+      id: "certificate:testssl:certificate_compression",
+      sourceId: "certificate_compression",
+      status: "info",
+      evidenceKind: "tested",
+      severity: "info",
+      summary: "",
+    };
+    expect(() => validateDeepTlsResponse(blankInformation, {
+      hostname: "example.com",
+      address: "8.8.8.8",
+      deadlineMs: 180_000,
+    })).toThrow(/invalid report/u);
   });
 
   it("normalizes oversized displayed evidence below the endpoint and combined Workflow caps", () => {
@@ -368,14 +383,35 @@ describe("global assessment coordinator", () => {
     expect(workflowTerminate).not.toHaveBeenCalled();
 
     const result = completedJob([deepReport("example.com", "8.8.8.8")]).result;
+    if (!result) throw new Error("Missing completed result fixture.");
+    result.tls.endpoints[0]!.sections.certificate.observations[0] = {
+      id: "certificate:testssl:certificate_compression",
+      sourceId: "certificate_compression",
+      status: "info",
+      evidenceKind: "tested",
+      severity: "info",
+      summary: "",
+    };
     const completion = await coordinator.fetch(jsonInternalRequest(`/jobs/${firstId}/complete`, { result }));
     expect(completion.status).toBe(200);
+    const completed = await completion.json() as SecurityAssessmentJobResource;
+    expect(completed.result?.tls.endpoints[0]?.sections.certificate.observations[0]?.summary)
+      .toBe("No bounded finding was returned.");
     expect(containerDestroy).toHaveBeenCalledTimes(4);
     containerDestroy.mockClear();
+
+    const retained = sql.rows.get(firstId);
+    if (!retained?.result_json) throw new Error("Missing retained result fixture.");
+    const legacyCachedResult = JSON.parse(retained.result_json) as SecurityAssessmentResult;
+    legacyCachedResult.tls.endpoints[0]!.sections.certificate.observations[0]!.summary = "";
+    retained.result_json = JSON.stringify(legacyCachedResult);
+
     const cached = await coordinatorCreate(coordinator, jobId(3), "example.com", ["8.8.8.8"], "cc".repeat(32));
     expect(cached.reuse).toBe("cache-hit");
     expect(cached.job.jobId).toBe(firstId);
     expect(cached.job.status).toBe("complete");
+    expect(cached.job.result?.tls.endpoints[0]?.sections.certificate.observations[0]?.summary)
+      .toBe("No bounded finding was returned.");
     expect(sql.rows.size).toBe(1);
     expect(workflowCreate).toHaveBeenCalledTimes(1);
 

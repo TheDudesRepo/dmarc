@@ -129,7 +129,7 @@ export function createWorker(overrides: Partial<WorkerDependencies> = {}) {
         return jsonResponse({
           status: "ok",
           service: "cresswell-security-lab",
-          version: "0.5.0",
+          version: "0.5.1",
           deploymentId: env.VERSION_METADATA?.id ?? null,
         });
       }

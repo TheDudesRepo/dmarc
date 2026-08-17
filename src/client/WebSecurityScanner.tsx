@@ -1162,7 +1162,7 @@ function DeepRemediation({
         return (
           <li key={`${issue.section}-${issue.id}`}>
             <PriorityBadge priority={deepSeverityPriority(issue.severity)} />
-            <div><strong>{issue.summary}</strong><p>{observation?.summary}</p><small>{formatLabel(issue.section)} · {formatLabel(issue.evidenceKind)}</small></div>
+            <div><strong>{issue.summary}</strong><p>{observation ? observationSummary(observation) : "The linked scanner observation was not included in this report."}</p><small>{formatLabel(issue.section)} · {formatLabel(issue.evidenceKind)}</small></div>
             <span>{sectionRemediation(issue.section)}</span>
           </li>
         );
@@ -1212,7 +1212,7 @@ function DeepObservationMatrix({
             <div role="row" key={observation.id}>
               <span role="cell"><strong>{observationLabel(observation)}</strong><small>{observation.sourceId ?? observation.id}</small></span>
               <span role="cell"><DeepStatusPill status={observation.status} /><small>{formatLabel(observation.severity)}</small></span>
-              <span role="cell"><EvidenceBadge kind={observation.evidenceKind} /><small>{observation.summary}</small></span>
+              <span role="cell"><EvidenceBadge kind={observation.evidenceKind} /><small>{observationSummary(observation)}</small></span>
               <span role="cell"><ObservationDetails details={observation.details} /></span>
             </div>
           ))}
@@ -1225,7 +1225,7 @@ function DeepObservationMatrix({
 function DeepObservationCard({ observation }: { observation: DeepTlsObservation }) {
   return (
     <article className={`deep-observation-card observation-${observation.status}`}>
-      <div><span><DeepStatusPill status={observation.status} /><EvidenceBadge kind={observation.evidenceKind} /></span><strong>{observationLabel(observation)}</strong><small>{observation.summary}</small></div>
+      <div><span><DeepStatusPill status={observation.status} /><EvidenceBadge kind={observation.evidenceKind} /></span><strong>{observationLabel(observation)}</strong><small>{observationSummary(observation)}</small></div>
       <ObservationDetails details={observation.details} />
     </article>
   );
@@ -1701,7 +1701,7 @@ function buildAssessmentIssues(result: SecurityAssessmentResult): ReportIssue[] 
             id: `${sectionName}:${observation.id}`,
             priority,
             title: observationLabel(observation),
-            detail: issue?.summary ?? observation.summary,
+            detail: issue?.summary ?? observationSummary(observation),
             source: "TLS",
             endpoint: endpoint.target.address,
           };
@@ -1769,6 +1769,11 @@ function summarizeIssueSeverities(issues: readonly DeepTlsIssue[]): string {
 
 function observationLabel(observation: DeepTlsObservation): string {
   return formatObservationKey(observation.sourceId ?? observation.id.split(":").at(-1) ?? observation.id);
+}
+
+function observationSummary(observation: DeepTlsObservation): string {
+  return observation.summary.trim()
+    || "The scanner reported this informational measurement without a narrative summary.";
 }
 
 function formatObservationKey(value: string): string {
@@ -2251,6 +2256,11 @@ function isDeepTlsSection(value: unknown): value is DeepTlsSection {
 
 function isDeepTlsObservation(value: unknown): value is DeepTlsObservation {
   if (!isObject(value) || !hasOnlyKeys(value, ["id", "sourceId", "status", "evidenceKind", "severity", "summary", "details"])) return false;
+  const safeInformationalSummaryOmission = value.summary === ""
+    && value.status === "info"
+    && value.evidenceKind === "tested"
+    && value.severity === "info"
+    && isText(value.sourceId, 128);
   return isDeepIdentifier(value.id)
     && (value.sourceId === undefined || isText(value.sourceId, 128))
     && typeof value.status === "string"
@@ -2259,7 +2269,7 @@ function isDeepTlsObservation(value: unknown): value is DeepTlsObservation {
     && DEEP_EVIDENCE_KIND_SET.has(value.evidenceKind)
     && typeof value.severity === "string"
     && DEEP_SEVERITY_SET.has(value.severity)
-    && isText(value.summary, 2_048)
+    && (isText(value.summary, 2_048) || safeInformationalSummaryOmission)
     && (value.details === undefined || isDeepTlsDetails(value.details));
 }
 

@@ -229,7 +229,7 @@ function normalizeRecord(record, sectionName) {
   if (!record || typeof record !== "object") return undefined;
   const sourceId = sanitizeId(record.id);
   if (!sourceId) return undefined;
-  const finding = sanitizeText(record.finding ?? "No bounded finding was returned.");
+  const finding = sanitizeText(record.finding) || "No bounded finding was returned.";
   const mapped = TESTSSL_SEVERITY[String(record.severity ?? "INFO").toUpperCase()] ?? TESTSSL_SEVERITY.INFO;
   const status = semanticStatus(sectionName, sourceId, finding, mapped.status);
   const severity = status === "pass" ? "none" : mapped.severity;

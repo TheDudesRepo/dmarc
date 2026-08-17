@@ -130,6 +130,32 @@ describe("combined assessment response validation", () => {
     expect(isSecurityAssessmentResult(result, "example.com")).toBe(true);
   });
 
+  it("accepts a live-shaped empty summary only for non-actionable tested information", () => {
+    const endpoint = deepEndpoint();
+    endpoint.sections.certificate.observations.push(observation(
+      "certificate",
+      "certificate_compression",
+      "info",
+      "tested",
+      "",
+      undefined,
+      "info",
+    ));
+    const result = assessmentResult({ tls: deepAssessment([endpoint]) });
+
+    expect(isSecurityAssessmentResult(result, "example.com")).toBe(true);
+    expect(isSecurityAssessmentResult({
+      ...result,
+      tls: {
+        ...result.tls,
+        endpoints: [{
+          ...endpoint,
+          sections: mutateObservation(endpoint.sections, "certificate", { summary: "", status: "warning" }),
+        }],
+      },
+    }, "example.com")).toBe(false);
+  });
+
   it("enforces the final deep connection and response budgets", () => {
     const result = assessmentResult();
     const endpoint = result.tls.endpoints[0];
@@ -280,6 +306,33 @@ describe("combined assessment interactions", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(screen.getByText("Reused valid cached report")).toBeTruthy();
+  });
+
+  it("renders a clear fallback for a safe informational observation with no producer summary", async () => {
+    const endpoint = deepEndpoint();
+    endpoint.sections.certificate.observations.push(observation(
+      "certificate",
+      "certificate_compression",
+      "info",
+      "tested",
+      "",
+      undefined,
+      "info",
+    ));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(createResponse("complete", {
+      reuse: "cache-hit",
+      pollAfterSeconds: 0,
+      cancelToken: undefined,
+      result: assessmentResult({ tls: deepAssessment([endpoint]) }),
+    }))));
+    render(<WebSecurityScanner suggestedDomain="example.com" />);
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /I confirm I own or administer/u }));
+    fireEvent.click(screen.getByRole("button", { name: "Run combined assessment" }));
+    await screen.findByRole("heading", { name: "example.com" });
+
+    expect(screen.getByText("Certificate Compression")).toBeTruthy();
+    expect(screen.getByText("The scanner reported this informational measurement without a narrative summary.")).toBeTruthy();
   });
 
   it("keeps neutral TLS information out of remediation priority counts", async () => {

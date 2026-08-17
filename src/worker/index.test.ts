@@ -40,7 +40,7 @@ describe("Worker API boundary", () => {
     expect(body).toEqual(expect.objectContaining({
       status: "ok",
       service: "cresswell-security-lab",
-      version: "0.5.0",
+      version: "0.5.1",
       deploymentId: null,
     }));
     expect(response.headers.get("content-security-policy")).toContain("default-src 'none'");

@@ -37,7 +37,7 @@
     "typescript": "^7.0.2",
     "vitest": "^4.1.10",
     "workerd": "1.20260811.1",
-    "wrangler": "^4.120.0"
+    "wrangler": "^4.123.0"
   },
   "engines": {
     "node": ">=24.0.0"

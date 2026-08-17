@@ -36,13 +36,13 @@
     "miniflare": "5.20260801.1-alpha",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10",
-    "workerd": "1.20260811.1",
+    "workerd": "1.20260813.1",
     "wrangler": "^4.120.0"
   },
   "engines": {
     "node": ">=24.0.0"
   },
   "overrides": {
-    "workerd": "1.20260811.1"
+    "workerd": "1.20260813.1"
   }
 }
